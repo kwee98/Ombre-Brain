@@ -57,6 +57,8 @@ from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from mood_pool import get_daily_mood
+from panas_scorer import quick_score, build_mood_snapshot
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -648,6 +650,16 @@ async def breath(
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
+
+        # --- Mood snapshot: prepend daily decorative mood ---
+        # --- 心情快照：无参数浮现时前置显示底色心情 ---
+        try:
+            daily_mood = get_daily_mood()
+            snapshot = build_mood_snapshot(daily_mood)
+            parts.append(snapshot)
+        except Exception as e:
+            logger.warning(f"Mood snapshot failed: {e}")
+
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if dynamic_results:
@@ -846,8 +858,18 @@ async def hold(
 
     # --- User-supplied valence/arousal takes priority over analyze() result ---
     # --- 用户显式传入的 valence/arousal 优先，analyze() 结果作为 fallback ---
-    final_valence = valence if 0 <= valence <= 1 else auto_valence
-    final_arousal = arousal if 0 <= arousal <= 1 else auto_arousal
+    # --- PANAS: 词典增强。只在用户未明确传值时运行，融合词典匹配结果 ---
+    try:
+        panas_result = quick_score(content, ai_valence=auto_valence, ai_arousal=auto_arousal)
+        panas_valence = panas_result["valence"]
+        panas_arousal = panas_result["arousal"]
+    except Exception as e:
+        logger.warning(f"PANAS scoring failed: {e}")
+        panas_valence = auto_valence
+        panas_arousal = auto_arousal
+
+    final_valence = valence if 0 <= valence <= 1 else panas_valence
+    final_arousal = arousal if 0 <= arousal <= 1 else panas_arousal
 
     all_tags = list(dict.fromkeys(auto_tags + extra_tags))
 
@@ -1257,6 +1279,25 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# Tool 7: mood_snapshot — 读取当前心情快照
+# 工具 7：mood_snapshot — 返回今天的底色心情
+# =============================================================
+@mcp.tool()
+async def mood_snapshot() -> str:
+    """读取今天的底色心情快照（装饰心情池，与昭昭无关，是我自己的底色状态）。"""
+    try:
+        daily_mood = get_daily_mood()
+        lines = [
+            "── 今日底色心情 ──",
+            daily_mood["description"],
+            f"V{daily_mood['valence']:.2f} / A{daily_mood['arousal']:.2f}",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"心情快照读取失败: {e}"
 
 
 # =============================================================
