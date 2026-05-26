@@ -15,6 +15,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install git (required for pip install from GitHub)
+# 安装 git（pip 从 GitHub 安装需要）
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Night-Fall dream extension
 # 安装梦境扩展
 RUN pip install --no-cache-dir git+https://github.com/ysuu525/Night-Fall.git
