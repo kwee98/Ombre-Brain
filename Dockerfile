@@ -15,6 +15,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Install Night-Fall dream extension
+# 安装梦境扩展
+RUN pip install --no-cache-dir git+https://github.com/ysuu525/Night-Fall.git
+
 # Copy project files / 复制项目文件
 COPY *.py .
 COPY dashboard.html .
@@ -28,7 +32,10 @@ VOLUME ["/app/buckets"]
 # 容器场景默认用 streamable-http
 ENV OMBRE_TRANSPORT=streamable-http
 ENV OMBRE_BUCKETS_DIR=/app/buckets
+# Night-Fall integration
+ENV OMBRE_HOME=/app
+ENV NIGHT_FALL_DATA_DIR=/app/buckets/night_fall
 
 EXPOSE 8000
 
-CMD ["python", "server.py"]
+CMD ["python", "-m", "night_fall.launcher"]
