@@ -2296,6 +2296,60 @@ async def api_system_status(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+# =============================================================
+# /api/wallet /api/board /api/progress /api/reading
+# Dashboard 扩展模块 API
+# =============================================================
+
+@mcp.custom_route("/api/wallet", methods=["GET"])
+async def api_wallet(request):
+    """Return wallet balance and recent records."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse(wallet_read(limit=50))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/board", methods=["GET"])
+async def api_board_data(request):
+    """Return board messages."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        msgs = board_read(limit=50)
+        return JSONResponse(msgs)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/progress", methods=["GET"])
+async def api_progress_data(request):
+    """Return progress board grouped by status."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse(progress_read())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/reading", methods=["GET"])
+async def api_reading_data(request):
+    """Return reading log."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err: return err
+    try:
+        return JSONResponse(reading_log_read(limit=50))
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # --- Entry point / 启动入口 ---
 if __name__ == "__main__":
     transport = config.get("transport", "stdio")

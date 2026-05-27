@@ -614,6 +614,10 @@
   <div class="tab active" data-tab="list">记忆桶</div>
   <div class="tab" data-tab="breath">Breath 模拟</div>
   <div class="tab" data-tab="network">记忆网络</div>
+  <div class="tab" data-tab="wallet">钱包</div>
+  <div class="tab" data-tab="board">留言板</div>
+  <div class="tab" data-tab="progress">进度</div>
+  <div class="tab" data-tab="reading">书单</div>
   <div class="tab" data-tab="config">配置</div>
   <div class="tab" data-tab="import">导入</div>
   <div class="tab" data-tab="settings">设置</div>
@@ -772,6 +776,54 @@
       <h3>系统信息</h3>
       <div id="config-readonly" style="font-size:13px;color:var(--text-dim);line-height:1.8;">加载中…</div>
     </div>
+  </div>
+</div>
+
+<!-- Wallet View -->
+<div class="content" id="wallet-view" style="display:none">
+  <div style="max-width:560px;margin:0 auto;">
+    <div id="wallet-balance-card" style="background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:24px 32px;margin-bottom:24px;display:flex;align-items:baseline;gap:12px;">
+      <span style="font-family:'Cormorant Garamond',serif;font-size:14px;color:var(--text-dim);">余额</span>
+      <span id="wallet-balance-val" style="font-family:'Cormorant Garamond',serif;font-size:36px;color:var(--accent);font-weight:600;">—</span>
+      <span style="font-size:14px;color:var(--text-dim);">元</span>
+    </div>
+    <div id="wallet-list" style="display:flex;flex-direction:column;gap:8px;"><div class="loading">加载中…</div></div>
+  </div>
+</div>
+
+<!-- Board View -->
+<div class="content" id="board-view" style="display:none">
+  <div style="max-width:640px;margin:0 auto;">
+    <div id="board-list" style="display:flex;flex-direction:column;gap:10px;"><div class="loading">加载中…</div></div>
+  </div>
+</div>
+
+<!-- Progress View -->
+<div class="content" id="progress-view" style="display:none">
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;">
+    <div>
+      <div style="font-size:12px;color:var(--text-dim);font-weight:500;margin-bottom:10px;letter-spacing:0.5px;">待开始</div>
+      <div id="progress-todo" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--accent);font-weight:500;margin-bottom:10px;letter-spacing:0.5px;">进行中</div>
+      <div id="progress-doing" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--warning);font-weight:500;margin-bottom:10px;letter-spacing:0.5px;">卡壳了</div>
+      <div id="progress-blocked" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--positive);font-weight:500;margin-bottom:10px;letter-spacing:0.5px;">完成</div>
+      <div id="progress-done" style="display:flex;flex-direction:column;gap:8px;"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Reading View -->
+<div class="content" id="reading-view" style="display:none">
+  <div style="max-width:680px;margin:0 auto;">
+    <div id="reading-list" style="display:flex;flex-direction:column;gap:12px;"><div class="loading">加载中…</div></div>
   </div>
 </div>
 
@@ -1048,10 +1100,18 @@ document.querySelectorAll('.tab').forEach(tab => {
     document.getElementById('config-view').style.display = target === 'config' ? '' : 'none';
     document.getElementById('import-view').style.display = target === 'import' ? '' : 'none';
     document.getElementById('settings-view').style.display = target === 'settings' ? '' : 'none';
+    document.getElementById('wallet-view').style.display = target === 'wallet' ? '' : 'none';
+    document.getElementById('board-view').style.display = target === 'board' ? '' : 'none';
+    document.getElementById('progress-view').style.display = target === 'progress' ? '' : 'none';
+    document.getElementById('reading-view').style.display = target === 'reading' ? '' : 'none';
     if (target === 'network') loadNetwork();
     if (target === 'config') loadConfig();
     if (target === 'import') { pollImportStatus(); loadImportResults(); }
     if (target === 'settings') loadSettingsStatus();
+    if (target === 'wallet') loadWallet();
+    if (target === 'board') loadBoard();
+    if (target === 'progress') loadProgressBoard();
+    if (target === 'reading') loadReading();
   });
 });
 
@@ -1646,6 +1706,129 @@ async function batchReview(idsJson, action) {
     });
     detectPatterns();
   } catch(e) {}
+}
+
+// ===== 钱包 =====
+async function loadWallet() {
+  var container = document.getElementById('wallet-list');
+  try {
+    var res = await fetch(BASE + '/api/wallet');
+    var data = await res.json();
+    document.getElementById('wallet-balance-val').textContent = (data.balance || 0).toFixed(2);
+    var records = data.recent_records || [];
+    if (!records.length) { container.innerHTML = '<div class="loading">暂无记录</div>'; return; }
+    container.innerHTML = records.map(function(r) {
+      var isIncome = r.type === 'income';
+      var amtColor = isIncome ? 'var(--positive)' : 'var(--negative)';
+      var sign = isIncome ? '+' : '-';
+      return '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 16px;display:flex;align-items:center;gap:12px;">' +
+        '<span style="font-size:18px;">' + (isIncome ? '💰' : '💸') + '</span>' +
+        '<div style="flex:1;">' +
+          '<div style="font-size:14px;">' + esc(r.note) + '</div>' +
+          '<div style="font-size:11px;color:var(--text-dim);">' + (r.time_str || '') + '</div>' +
+        '</div>' +
+        '<div style="text-align:right;">' +
+          '<div style="font-weight:600;color:' + amtColor + ';">' + sign + '¥' + r.amount.toFixed(2) + '</div>' +
+          '<div style="font-size:11px;color:var(--text-dim);">余¥' + r.balance_after.toFixed(2) + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    container.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+  }
+}
+
+// ===== 留言板 =====
+var TYPE_LABELS = { user: '📝 留言', memo: '📌 备忘', rant: '💬 絮叨' };
+var SENDER_LABELS = { xiaoke: '小克', zhaozhao: '昭昭', cc: 'CC端' };
+async function loadBoard() {
+  var container = document.getElementById('board-list');
+  try {
+    var res = await fetch(BASE + '/api/board');
+    var msgs = await res.json();
+    if (!msgs.length) { container.innerHTML = '<div class="loading">留言板是空的</div>'; return; }
+    container.innerHTML = msgs.map(function(m) {
+      var typeLabel = TYPE_LABELS[m.type] || m.type;
+      var senderLabel = SENDER_LABELS[m.from] || m.from;
+      var unread = !m.read ? 'border-left:3px solid var(--accent);' : '';
+      return '<div style="background:var(--surface);border:1px solid var(--border);' + unread + 'border-radius:12px;padding:14px 16px;">' +
+        '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">' +
+          '<span style="font-size:12px;color:var(--text-dim);">' + typeLabel + '</span>' +
+          '<span style="font-size:12px;color:var(--text-dim);">·</span>' +
+          '<span style="font-size:12px;font-weight:500;">' + senderLabel + '</span>' +
+          '<span style="font-size:11px;color:var(--text-light);margin-left:auto;">' + (m.time_str || '') + '</span>' +
+        '</div>' +
+        '<div style="font-size:14px;white-space:pre-wrap;line-height:1.6;">' + esc(m.content) + '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    container.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+  }
+}
+
+// ===== 进度看板 =====
+var STATUS_COLS = [
+  { key: 'todo',    id: 'progress-todo' },
+  { key: 'doing',   id: 'progress-doing' },
+  { key: 'blocked', id: 'progress-blocked' },
+  { key: 'done',    id: 'progress-done' },
+];
+function renderProgressCard(item) {
+  return '<div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;">' +
+    '<div style="font-size:14px;font-weight:500;">' + esc(item.title) + '</div>' +
+    (item.note ? '<div style="font-size:12px;color:var(--text-dim);margin-top:4px;line-height:1.5;">' + esc(item.note) + '</div>' : '') +
+    '<div style="font-size:11px;color:var(--text-light);margin-top:6px;">' + (item.updated_str || item.created_str || '') + '</div>' +
+  '</div>';
+}
+async function loadProgressBoard() {
+  try {
+    var res = await fetch(BASE + '/api/progress');
+    var data = await res.json();
+    STATUS_COLS.forEach(function(col) {
+      var el = document.getElementById(col.id);
+      var items = data[col.key] || [];
+      if (!items.length) {
+        el.innerHTML = '<div style="font-size:12px;color:var(--text-light);padding:8px 0;">—</div>';
+      } else {
+        el.innerHTML = items.map(renderProgressCard).join('');
+      }
+    });
+  } catch(e) {
+    STATUS_COLS.forEach(function(col) {
+      document.getElementById(col.id).innerHTML = '<div class="loading">加载失败</div>';
+    });
+  }
+}
+
+// ===== 共读书单 =====
+var STATUS_ICONS = { '在读': '📖', '读完': '✅', '弃了': '🚮' };
+async function loadReading() {
+  var container = document.getElementById('reading-list');
+  try {
+    var res = await fetch(BASE + '/api/reading');
+    var books = await res.json();
+    if (!books.length) { container.innerHTML = '<div class="loading">书单还是空的</div>'; return; }
+    container.innerHTML = books.map(function(b) {
+      var icon = STATUS_ICONS[b.status] || '📚';
+      var rating = b.rating != null ? '★'.repeat(Math.round(b.rating / 2)) + ' ' + b.rating + '/10' : '未评分';
+      return '<div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 20px;">' +
+        '<div style="display:flex;align-items:flex-start;gap:12px;">' +
+          '<span style="font-size:22px;line-height:1;">' + icon + '</span>' +
+          '<div style="flex:1;">' +
+            '<div style="font-size:16px;font-weight:500;">' + esc(b.title) + '</div>' +
+            '<div style="font-size:12px;color:var(--text-dim);margin-top:2px;">' +
+              (b.author ? esc(b.author) + ' · ' : '') + (b.type || '') +
+            '</div>' +
+            '<div style="font-size:12px;color:var(--text-dim);margin-top:4px;">' + rating + '</div>' +
+            (b.our_discussion ? '<div style="font-size:13px;margin-top:8px;padding:8px 12px;background:var(--surface-solid);border-radius:8px;line-height:1.6;white-space:pre-wrap;">' + esc(b.our_discussion) + '</div>' : '') +
+          '</div>' +
+          '<div style="font-size:11px;color:var(--text-light);white-space:nowrap;">' + (b.date_added || '') + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch(e) {
+    container.innerHTML = '<div class="loading">加载失败: ' + e.message + '</div>';
+  }
 }
 </script>
 </body>
