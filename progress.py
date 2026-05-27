@@ -26,7 +26,7 @@ VALID_STATUSES = ("todo", "doing", "blocked", "done")
 
 
 def _get_progress_file(buckets_dir: str) -> str:
-    ext_dir = os.path.join(os.path.dirname(buckets_dir), "extensions")
+    ext_dir = os.path.join(buckets_dir, "extensions")
     os.makedirs(ext_dir, exist_ok=True)
     return os.path.join(ext_dir, "progress.json")
 

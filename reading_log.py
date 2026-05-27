@@ -24,7 +24,7 @@ VALID_STATUSES = ("在读", "读完", "弃了")
 
 
 def _get_reading_file(buckets_dir: str) -> str:
-    ext_dir = os.path.join(os.path.dirname(buckets_dir), "extensions")
+    ext_dir = os.path.join(buckets_dir, "extensions")
     os.makedirs(ext_dir, exist_ok=True)
     return os.path.join(ext_dir, "reading_log.json")
 
