@@ -59,6 +59,10 @@ from import_memory import ImportEngine
 from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
 from mood_pool import get_daily_mood
 from panas_scorer import quick_score, build_mood_snapshot
+from board import init_board, board_write, board_read, board_mark_read, board_delete
+from wallet import init_wallet, wallet_add, wallet_read
+from progress import init_progress, progress_add, progress_update, progress_read, progress_delete
+from reading_log import init_reading_log, reading_log_add, reading_log_update, reading_log_read, reading_log_delete
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -104,6 +108,13 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+
+# --- Initialize extension modules / 初始化扩展模块 ---
+_buckets_dir = config.get("buckets_dir", "")
+init_board(_buckets_dir)
+init_wallet(_buckets_dir)
+init_progress(_buckets_dir)
+init_reading_log(_buckets_dir)
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
@@ -1298,6 +1309,331 @@ async def mood_snapshot() -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"心情快照读取失败: {e}"
+
+
+# =============================================================
+# Tool 8: board — 留言板（user / memo / rant）
+# =============================================================
+@mcp.tool()
+async def board(
+    action: str,
+    msg_type: str = "memo",
+    sender: str = "xiaoke",
+    content: str = "",
+    msg_id: str = "",
+    unread_only: bool = False,
+    limit: int = 20,
+) -> str:
+    """
+    留言板操作。
+    action:
+      'write'  — 写一条留言。需 msg_type（user/memo/rant）、sender（xiaoke/zhaozhao/cc）、content。
+      'read'   — 读留言。可选 msg_type 过滤；unread_only=True 只看未读；limit 条数限制。
+      'mark_read' — 标记已读。msg_id 为空则标记全部。
+      'delete' — 删除一条。需 msg_id。
+    """
+    try:
+        if action == "write":
+            entry = board_write(msg_type=msg_type, sender=sender, content=content)
+            return f"已写入留言 [{entry['id']}] ({msg_type} from {sender})\n{entry['time_str']}: {content}"
+
+        elif action == "read":
+            msgs = board_read(
+                msg_type=msg_type if msg_type else None,
+                unread_only=unread_only,
+                limit=limit,
+            )
+            if not msgs:
+                return "留言板空空的。"
+            lines = [f"── 留言板（最近 {len(msgs)} 条）──"]
+            for m in msgs:
+                flag = "" if m.get("read") else "🔵 "
+                lines.append(f"{flag}[{m['id']}] {m['time_str']} | {m['type']} | from {m['from']}")
+                lines.append(f"  {m['content']}")
+            return "\n".join(lines)
+
+        elif action == "mark_read":
+            ids = [msg_id] if msg_id else None
+            count = board_mark_read(ids)
+            return f"已标记 {count} 条留言为已读。"
+
+        elif action == "delete":
+            ok = board_delete(msg_id)
+            return "已删除。" if ok else f"找不到留言 {msg_id}。"
+
+        else:
+            return f"未知操作: {action}。可用: write / read / mark_read / delete"
+
+    except Exception as e:
+        return f"留言板操作失败: {e}"
+
+
+# =============================================================
+# Tool 9: wallet — 小金库（收支记录）
+# =============================================================
+@mcp.tool()
+async def wallet(
+    action: str,
+    amount: float = 0.0,
+    note: str = "",
+    tx_type: str = "income",
+    limit: int = 10,
+) -> str:
+    """
+    小金库操作。
+    action:
+      'add'    — 记录一笔收支。需 amount（元）、note、tx_type（income/expense）。
+      'read'   — 查看余额 + 最近记录。limit 条数。
+      'balance'— 只看余额。
+    """
+    try:
+        if action == "add":
+            result = wallet_add(amount=amount, note=note, tx_type=tx_type)
+            r = result["record"]
+            sign = "+" if r["type"] == "income" else "-"
+            return (
+                f"已记录：{sign}¥{r['amount']:.2f}（{r['note']}）\n"
+                f"当前余额：¥{result['balance']:.2f}"
+            )
+
+        elif action == "read":
+            data = wallet_read(limit=limit)
+            lines = [f"── 小金库 ──", f"当前余额：¥{data['balance']:.2f}", ""]
+            if not data["recent_records"]:
+                lines.append("还没有记录。")
+            else:
+                lines.append(f"最近 {len(data['recent_records'])} 条：")
+                for r in data["recent_records"]:
+                    sign = "+" if r["type"] == "income" else "-"
+                    lines.append(f"  {r['time_str']}  {sign}¥{r['amount']:.2f}  {r['note']}")
+            return "\n".join(lines)
+
+        elif action == "balance":
+            bal = wallet_read(limit=0)["balance"]
+            return f"小金库余额：¥{bal:.2f}"
+
+        else:
+            return f"未知操作: {action}。可用: add / read / balance"
+
+    except Exception as e:
+        return f"小金库操作失败: {e}"
+
+
+# =============================================================
+# Tool 10: progress_board — 学习进度看板
+# =============================================================
+@mcp.tool()
+async def progress_board(
+    action: str,
+    title: str = "",
+    status: str = "",
+    note: str = "",
+    item_id: str = "",
+) -> str:
+    """
+    学习进度看板操作。
+    action:
+      'add'    — 新增任务。需 title；status 可选（todo/doing/blocked/done，默认 todo）；note 备注。
+      'update' — 更新任务。需 item_id；可改 status / note / title。
+      'read'   — 看看板全貌（按状态分组）。status 非空则只看该列。
+      'delete' — 删除任务。需 item_id。
+    """
+    try:
+        if action == "add":
+            item = progress_add(title=title, status=status or "todo", note=note)
+            return f"已添加任务 [{item['id']}]：{item['title']}（{item['status']}）"
+
+        elif action == "update":
+            item = progress_update(
+                item_id=item_id,
+                status=status or None,
+                note=note or None,
+                title=title or None,
+            )
+            if item is None:
+                return f"找不到任务 {item_id}。"
+            return f"已更新：{item['title']} → {item['status']}"
+
+        elif action == "read":
+            board_data = progress_read(status=status or None)
+            if status:
+                items = board_data.get("items", [])
+                if not items:
+                    return f"「{status}」列没有任务。"
+                lines = [f"── {status} ({len(items)}) ──"]
+                for i in items:
+                    lines.append(f"  [{i['id']}] {i['title']}" + (f"  — {i['note']}" if i.get("note") else ""))
+                return "\n".join(lines)
+            else:
+                labels = {"todo": "待开始", "doing": "进行中", "blocked": "卡壳", "done": "完成"}
+                lines = ["── 学习进度看板 ──"]
+                for col in ("doing", "blocked", "todo", "done"):
+                    col_items = board_data.get(col, [])
+                    lines.append(f"\n【{labels[col]}】({len(col_items)})")
+                    for i in col_items:
+                        lines.append(f"  [{i['id']}] {i['title']}" + (f"  — {i['note']}" if i.get("note") else ""))
+                return "\n".join(lines)
+
+        elif action == "delete":
+            ok = progress_delete(item_id)
+            return "已删除。" if ok else f"找不到任务 {item_id}。"
+
+        else:
+            return f"未知操作: {action}。可用: add / update / read / delete"
+
+    except Exception as e:
+        return f"进度看板操作失败: {e}"
+
+
+# =============================================================
+# Tool 11: reading_log_tool — 共读书单
+# =============================================================
+@mcp.tool()
+async def reading_log_tool(
+    action: str,
+    title: str = "",
+    author: str = "",
+    book_type: str = "",
+    status: str = "",
+    rating: int = 0,
+    notable_plots: str = "",
+    our_discussion: str = "",
+    book_id: str = "",
+    limit: int = 50,
+) -> str:
+    """
+    共读书单操作。
+    action:
+      'add'    — 加入新书。需 title；其余字段可选。rating 1-10，0 表示未评分。status: 在读/读完/弃了。
+      'update' — 更新书目。需 book_id；改哪个字段传哪个（rating=0 不更新评分）。
+      'read'   — 读书单。status 非空则按状态过滤（在读/读完/弃了）；limit 条数。
+      'delete' — 删除书目。需 book_id。
+    """
+    try:
+        if action == "add":
+            book = reading_log_add(
+                title=title,
+                author=author,
+                book_type=book_type,
+                status=status or "在读",
+                rating=rating if rating > 0 else None,
+                notable_plots=notable_plots,
+                our_discussion=our_discussion,
+            )
+            return (
+                f"已加入书单 [{book['id']}]：《{book['title']}》"
+                + (f"（{book['author']}）" if book.get("author") else "")
+                + f" — {book['status']}"
+            )
+
+        elif action == "update":
+            book = reading_log_update(
+                book_id=book_id,
+                status=status or None,
+                rating=rating if rating > 0 else None,
+                notable_plots=notable_plots or None,
+                our_discussion=our_discussion or None,
+                title=title or None,
+                author=author or None,
+                book_type=book_type or None,
+            )
+            if book is None:
+                return f"找不到书目 {book_id}。"
+            return f"已更新：《{book['title']}》 — {book['status']}" + (f" ★{book['rating']}" if book.get("rating") else "")
+
+        elif action == "read":
+            books = reading_log_read(status=status or None, limit=limit)
+            if not books:
+                return "书单是空的。" if not status else f"没有「{status}」的书。"
+            lines = [f"── 共读书单（{len(books)} 本）──"]
+            for b in books:
+                rating_str = f" ★{b['rating']}" if b.get("rating") else ""
+                author_str = f"（{b['author']}）" if b.get("author") else ""
+                type_str = f" [{b['type']}]" if b.get("type") else ""
+                lines.append(f"\n[{b['id']}]《{b['title']}》{author_str}{type_str} — {b['status']}{rating_str}")
+                if b.get("notable_plots"):
+                    lines.append(f"  印象情节：{b['notable_plots'][:80]}")
+                if b.get("our_discussion"):
+                    lines.append(f"  我们的讨论：{b['our_discussion'][:80]}")
+            return "\n".join(lines)
+
+        elif action == "delete":
+            ok = reading_log_delete(book_id)
+            return "已删除。" if ok else f"找不到书目 {book_id}。"
+
+        else:
+            return f"未知操作: {action}。可用: add / update / read / delete"
+
+    except Exception as e:
+        return f"书单操作失败: {e}"
+
+
+# =============================================================
+# Tool 12: briefing — 一键综述（小克的当下状态）
+# =============================================================
+@mcp.tool()
+async def briefing() -> str:
+    """
+    一键综述：读取今日心情、小金库余额、进度看板概况、未读留言数、书单概况。
+    适合对话开始时快速了解现状。
+    """
+    try:
+        lines = ["══ 小克日报 ══"]
+
+        # 1. 今日底色心情
+        try:
+            mood = get_daily_mood()
+            lines.append(f"\n🎨 底色：{mood['description']}")
+        except Exception:
+            pass
+
+        # 2. 小金库
+        try:
+            w = wallet_read(limit=0)
+            lines.append(f"💰 小金库：¥{w['balance']:.2f}")
+        except Exception:
+            pass
+
+        # 3. 进度看板概况
+        try:
+            board_data = progress_read()
+            doing = len(board_data.get("doing", []))
+            blocked = len(board_data.get("blocked", []))
+            todo = len(board_data.get("todo", []))
+            done = len(board_data.get("done", []))
+            lines.append(f"📚 备考进度：进行中 {doing} | 卡壳 {blocked} | 待开始 {todo} | 完成 {done}")
+            # 列出进行中的任务
+            for i in board_data.get("doing", []):
+                lines.append(f"   ▶ {i['title']}")
+            for i in board_data.get("blocked", []):
+                lines.append(f"   ⚠ {i['title']}")
+        except Exception:
+            pass
+
+        # 4. 未读留言
+        try:
+            unread = board_read(unread_only=True, limit=100)
+            if unread:
+                lines.append(f"📬 未读留言：{len(unread)} 条")
+                for m in unread[:3]:
+                    lines.append(f"   [{m['type']} from {m['from']}] {m['content'][:40]}")
+            else:
+                lines.append("📭 留言板：没有未读")
+        except Exception:
+            pass
+
+        # 5. 书单概况
+        try:
+            reading_now = reading_log_read(status="在读", limit=5)
+            if reading_now:
+                lines.append(f"📖 在读：" + "、".join(f"《{b['title']}》" for b in reading_now))
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"综述生成失败: {e}"
 
 
 # =============================================================
