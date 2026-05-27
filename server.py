@@ -1421,7 +1421,7 @@ async def wallet(
                 lines.append(f"最近 {len(data['recent_records'])} 条：")
                 for r in data["recent_records"]:
                     sign = "+" if r["type"] == "income" else "-"
-                    lines.append(f"  {r['time_str']}  {sign}¥{r['amount']:.2f}  {r['note']}")
+                    lines.append(f"  [{r['id']}]  {r['time_str']}  {sign}¥{r['amount']:.2f}  {r['note']}")
             return "\n".join(lines)
 
         elif action == "balance":
