@@ -93,3 +93,25 @@ def wallet_read(limit: int = 10) -> dict:
 def wallet_balance() -> float:
     """只返回当前余额。"""
     return _load()["balance"]
+
+
+def wallet_delete(record_id: str) -> bool:
+    """
+    删除指定记录，并重新计算余额。
+    返回 True 表示删除成功，False 表示未找到。
+    """
+    data = _load()
+    before = len(data["records"])
+    data["records"] = [r for r in data["records"] if r["id"] != record_id]
+    if len(data["records"]) < before:
+        # 重算余额
+        balance = 0.0
+        for r in data["records"]:
+            if r.get("type") == "income":
+                balance += r.get("amount", 0)
+            elif r.get("type") == "expense":
+                balance -= r.get("amount", 0)
+        data["balance"] = round(balance, 2)
+        _save(data)
+        return True
+    return False

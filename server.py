@@ -60,7 +60,7 @@ from utils import load_config, setup_logging, strip_wikilinks, count_tokens_appr
 from mood_pool import get_daily_mood
 from panas_scorer import quick_score, build_mood_snapshot
 from board import init_board, board_write, board_read, board_mark_read, board_delete
-from wallet import init_wallet, wallet_add, wallet_read
+from wallet import init_wallet, wallet_add, wallet_read, wallet_delete
 from progress import init_progress, progress_add, progress_update, progress_read, progress_delete
 from reading_log import init_reading_log, reading_log_add, reading_log_update, reading_log_read, reading_log_delete
 
@@ -1392,6 +1392,7 @@ async def wallet(
     note: str = "",
     tx_type: str = "income",
     limit: int = 10,
+    record_id: str = "",
 ) -> str:
     """
     小金库操作。
@@ -1399,6 +1400,7 @@ async def wallet(
       'add'    — 记录一笔收支。需 amount（元）、note、tx_type（income/expense）。
       'read'   — 查看余额 + 最近记录。limit 条数。
       'balance'— 只看余额。
+      'delete' — 删除指定记录并重算余额。需 record_id（记录的 id 字段）。
     """
     try:
         if action == "add":
@@ -1426,8 +1428,18 @@ async def wallet(
             bal = wallet_read(limit=0)["balance"]
             return f"小金库余额：¥{bal:.2f}"
 
+        elif action == "delete":
+            if not record_id:
+                return "请提供 record_id。"
+            ok = wallet_delete(record_id)
+            if ok:
+                bal = wallet_read(limit=0)["balance"]
+                return f"已删除记录 {record_id}。当前余额：¥{bal:.2f}"
+            else:
+                return f"未找到记录 {record_id}。"
+
         else:
-            return f"未知操作: {action}。可用: add / read / balance"
+            return f"未知操作: {action}。可用: add / read / balance / delete"
 
     except Exception as e:
         return f"小金库操作失败: {e}"
