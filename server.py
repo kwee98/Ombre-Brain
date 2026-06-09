@@ -442,6 +442,7 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
+    sensory: dict = None,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -492,6 +493,7 @@ async def _merge_or_create(
         valence=valence,
         arousal=arousal,
         name=name or None,
+        sensory=sensory or None,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -558,6 +560,27 @@ async def breath(
             except Exception as e:
                 logger.warning(f"importance_min dehydrate failed: {e}")
         return "\n---\n".join(results) if results else "没有可以展示的记忆。"
+
+    # --- Feel retrieval: domain="feel" is a special channel (must check BEFORE no-query branch) ---
+    # --- Feel 检索：domain="feel" 是独立入口（必须在无参数浮现分支之前检查，否则会被 early return 截断）---
+    if domain and domain.strip().lower() == "feel":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
+            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
+            if not feels:
+                return "没有留下过 feel。"
+            results = []
+            for f in feels:
+                created = f["metadata"].get("created", "")
+                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
+                results.append(entry)
+                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
+                    break
+            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
+        except Exception as e:
+            logger.error(f"Feel retrieval failed: {e}")
+            return "读取 feel 失败。"
 
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
@@ -691,26 +714,6 @@ async def breath(
 
         return "\n\n".join(parts)
 
-    # --- Feel retrieval: domain="feel" is a special channel ---
-    # --- Feel 检索：domain="feel" 是独立入口 ---
-    if domain.strip().lower() == "feel":
-        try:
-            all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b["metadata"].get("type") == "feel"]
-            feels.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
-            if not feels:
-                return "没有留下过 feel。"
-            results = []
-            for f in feels:
-                created = f["metadata"].get("created", "")
-                entry = f"[{created}] [bucket_id:{f['id']}]\n{strip_wikilinks(f['content'])}"
-                results.append(entry)
-                if count_tokens_approx("\n---\n".join(results)) > max_tokens:
-                    break
-            return "=== 你留下的 feel ===\n" + "\n---\n".join(results)
-        except Exception as e:
-            logger.error(f"Feel retrieval failed: {e}")
-            return "读取 feel 失败。"
 
     # --- With args: search mode (keyword + vector dual channel) ---
     # --- 有参数：检索模式（关键词 + 向量双通道）---
@@ -770,6 +773,8 @@ async def breath(
             await bucket_mgr.touch(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
+            elif bucket.get("ripple"):
+                summary = f"[时间涟漪] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
@@ -880,6 +885,7 @@ async def hold(
     auto_arousal = analysis["arousal"]
     auto_tags = analysis["tags"]
     suggested_name = analysis.get("suggested_name", "")
+    auto_sensory = analysis.get("sensory", {})
 
     # --- User-supplied valence/arousal takes priority over analyze() result ---
     # --- 用户显式传入的 valence/arousal 优先，analyze() 结果作为 fallback ---
@@ -927,6 +933,7 @@ async def hold(
         valence=final_valence,
         arousal=final_arousal,
         name=suggested_name,
+        sensory=auto_sensory or None,
     )
 
     action = "合并→" if is_merged else "新建→"

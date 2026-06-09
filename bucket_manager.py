@@ -110,6 +110,7 @@ class BucketManager:
         name: str = None,
         pinned: bool = False,
         protected: bool = False,
+        sensory: dict = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -152,6 +153,8 @@ class BucketManager:
             metadata["pinned"] = True
         if protected:
             metadata["protected"] = True
+        if sensory and isinstance(sensory, dict):
+            metadata["sensory"] = sensory
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -539,7 +542,39 @@ class BucketManager:
                 continue
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        main_results = scored[:limit]
+
+        # --- Time ripple: surface temporally adjacent buckets from top hits ---
+        # --- 时间涟漪：对主命中结果附带浮现时间相邻的记忆 ---
+        seen_ids = {b["id"] for b in main_results}
+        ripple_extras = []
+        for hit in main_results[:3]:
+            hit_meta = hit.get("metadata", {})
+            created_str = hit_meta.get("created", hit_meta.get("last_active", ""))
+            try:
+                hit_time = datetime.fromisoformat(str(created_str))
+            except (ValueError, TypeError):
+                continue
+            for bucket in candidates:
+                if bucket["id"] in seen_ids:
+                    continue
+                b_meta = bucket.get("metadata", {})
+                if b_meta.get("type") in ("feel",):
+                    continue
+                b_created_str = b_meta.get("created", b_meta.get("last_active", ""))
+                try:
+                    b_time = datetime.fromisoformat(str(b_created_str))
+                    delta_hours = abs((hit_time - b_time).total_seconds()) / 3600
+                except (ValueError, TypeError):
+                    continue
+                if delta_hours <= 72:
+                    bucket = dict(bucket)
+                    bucket["ripple"] = True
+                    bucket["score"] = 25.0
+                    ripple_extras.append(bucket)
+                    seen_ids.add(bucket["id"])
+
+        return main_results + ripple_extras[:3]
 
     # ---------------------------------------------------------
     # Topic relevance sub-score:

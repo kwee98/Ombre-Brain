@@ -136,7 +136,10 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
    第二步—引申扩展：自动补充 8~10 个与当前场景语义相关的词，包括近义词、上位词、关联场景词、用户可能用不同措辞搜索的词
    两步合并为一个 tags 数组，总计 10~15 个
 5. suggested_name（建议桶名）：10字以内的简短标题
-6. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
+6. sensory（感官锚点，选填）：如内容包含具体可感知的细节，提取最多 2 个，没有就返回空对象 {}
+   可选字段：weather（天气/温度）、sound（声音）、visual（画面/颜色/光线）、touch（触感/气味/味道）
+   只填文本中真实出现的感官信息，不要编造
+7. 在 tags 和 suggested_name 中不要使用 [[]] 双链标记
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -144,7 +147,8 @@ ANALYZE_PROMPT = """你是一个内容分析器。请分析以下文本，输出
   "valence": 0.7,
   "arousal": 0.4,
   "tags": ["核心词1", "核心词2", "扩展词1", "扩展词2", "..."],
-  "suggested_name": "简短标题"
+  "suggested_name": "简短标题",
+  "sensory": {}
 }"""
 
 
@@ -383,6 +387,11 @@ class Dehydrator:
                     pass
             if metadata.get("digested"):
                 header += " [已消化]"
+            sensory = metadata.get("sensory", {})
+            if sensory and isinstance(sensory, dict):
+                parts = [f"{k}:{v}" for k, v in sensory.items() if v]
+                if parts:
+                    header += f" [感官:{' | '.join(parts)}]"
             header += "\n"
         
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
@@ -473,12 +482,16 @@ class Dehydrator:
         except (ValueError, TypeError):
             valence, arousal = 0.5, 0.3
 
+        raw_sensory = result.get("sensory", {})
+        sensory = raw_sensory if isinstance(raw_sensory, dict) else {}
+
         return {
             "domain": result.get("domain", ["未分类"])[:3],
             "valence": valence,
             "arousal": arousal,
             "tags": result.get("tags", [])[:15],
             "suggested_name": str(result.get("suggested_name", ""))[:20],
+            "sensory": sensory,
         }
 
     # ---------------------------------------------------------
@@ -496,6 +509,7 @@ class Dehydrator:
             "arousal": 0.3,
             "tags": [],
             "suggested_name": "",
+            "sensory": {},
         }
 
     # ---------------------------------------------------------
