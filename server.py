@@ -42,6 +42,7 @@ import hmac
 import secrets
 import time
 import json as _json_lib
+from datetime import datetime
 import httpx
 
 
@@ -1308,7 +1309,67 @@ async def dream() -> str:
         except Exception as e:
             logger.warning(f"Dream crystallization hint failed: {e}")
 
-    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
+    # --- Event aggregation hint: detect same-event memory fragments ---
+    event_hint = ""
+    if embedding_engine and embedding_engine.enabled and len(candidates) >= 2:
+        try:
+            agg_pool = candidates[:20]
+            agg_ids = [b["id"] for b in agg_pool]
+            agg_names = {b["id"]: b["metadata"].get("name", b["id"]) for b in agg_pool}
+            agg_created = {}
+            for b in agg_pool:
+                created_str = b["metadata"].get("created", "")
+                if created_str:
+                    try:
+                        agg_created[b["id"]] = datetime.fromisoformat(str(created_str))
+                    except ValueError:
+                        pass
+            agg_embeddings = {}
+            for bid in agg_ids:
+                if bid in agg_created:
+                    emb = await embedding_engine.get_embedding(bid)
+                    if emb is not None:
+                        agg_embeddings[bid] = emb
+            pairs = []
+            for i, id_a in enumerate(agg_ids):
+                for id_b in agg_ids[i+1:]:
+                    if id_a not in agg_embeddings or id_b not in agg_embeddings:
+                        continue
+                    time_diff = abs((agg_created[id_a] - agg_created[id_b]).total_seconds())
+                    if time_diff > 48 * 3600:
+                        continue
+                    sim = embedding_engine._cosine_similarity(agg_embeddings[id_a], agg_embeddings[id_b])
+                    if sim > 0.6:
+                        pairs.append((id_a, id_b, sim))
+            if pairs:
+                parent = {bid: bid for bid in agg_ids}
+
+                def _find(x):
+                    while parent[x] != x:
+                        parent[x] = parent[parent[x]]
+                        x = parent[x]
+                    return x
+
+                for id_a, id_b, _ in pairs:
+                    parent[_find(id_a)] = _find(id_b)
+                clusters: dict = {}
+                for bid in agg_ids:
+                    root = _find(bid)
+                    clusters.setdefault(root, []).append(bid)
+                multi = sorted(
+                    [c for c in clusters.values() if len(c) >= 2],
+                    key=len, reverse=True
+                )
+                if multi:
+                    lines = ["\n🧩 这些记忆可能属于同一事件——"]
+                    for cluster in multi[:3]:
+                        lines.append("  " + " + ".join(f"[{agg_names[bid]}]" for bid in cluster))
+                    lines.append("（用 grow 或 hold 可以手动合并，不会自动处理。）\n")
+                    event_hint = "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Dream event aggregation hint failed: {e}")
+
+    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + event_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
 
