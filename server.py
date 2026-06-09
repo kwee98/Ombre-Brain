@@ -61,6 +61,7 @@ from utils import load_config, setup_logging, strip_wikilinks, count_tokens_appr
 from mood_pool import get_daily_mood
 from panas_scorer import quick_score, build_mood_snapshot
 from board import init_board, board_write, board_read, board_mark_read, board_delete
+from thought_pool import ThoughtPool
 from wallet import init_wallet, wallet_add, wallet_read, wallet_delete
 from progress import init_progress, progress_add, progress_update, progress_read, progress_delete
 from reading_log import init_reading_log, reading_log_add, reading_log_update, reading_log_read, reading_log_delete
@@ -116,6 +117,7 @@ init_board(_buckets_dir)
 init_wallet(_buckets_dir)
 init_progress(_buckets_dir)
 init_reading_log(_buckets_dir)
+thought_pool = ThoughtPool(_buckets_dir)
 
 # --- Night-Fall auto-surface hook (set by register_night_fall if installed) ---
 _night_fall_auto_surface = None
@@ -1369,13 +1371,51 @@ async def dream() -> str:
         except Exception as e:
             logger.warning(f"Dream event aggregation hint failed: {e}")
 
-    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + event_hint
+    fixation_hint = thought_pool.fixations_summary()
+    final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint + event_hint + fixation_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
 
 
 # =============================================================
-# Tool 7: mood_snapshot — 读取当前心情快照
+# Tool 7: think — 往念头池扔一个念头
+# =============================================================
+@mcp.tool()
+async def think(text: str, drive: str = "") -> str:
+    """往念头池里扔一个念头（闪念）。反复扔相似内容会让它升成执念。
+    drive 可选：attachment / curiosity / reflection / duty / social / libido / stress / fatigue"""
+    try:
+        result = thought_pool.add(text, drive=drive)
+        t = result["thought"]
+        action_map = {
+            "new": "新闪念已入池",
+            "boosted": "念头已加强",
+            "promoted": "闪念升为执念",
+            "fed": f"执念被触发（fed:{t.get('fed_count', 0)}）",
+        }
+        label = action_map.get(result["action"], result["action"])
+        return f"{label}：「{t['text']}」 强度:{t['strength']:.2f} 类型:{t['kind']}"
+    except Exception as e:
+        return f"念头池操作失败: {e}"
+
+
+# =============================================================
+# Tool 8: thoughts — 查看当前念头池状态
+# =============================================================
+@mcp.tool()
+async def thoughts() -> str:
+    """查看当前念头池——闪念和执念分层展示。"""
+    try:
+        output = thought_pool.format_output(show_flits=8)
+        if not output:
+            return "念头池是空的。"
+        return "=== 念头池 ===\n" + output
+    except Exception as e:
+        return f"念头池读取失败: {e}"
+
+
+# =============================================================
+# Tool 9: mood_snapshot — 读取当前心情快照
 # 工具 7：mood_snapshot — 返回今天的底色心情
 # =============================================================
 @mcp.tool()
