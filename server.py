@@ -57,7 +57,7 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, now_iso
 from mood_pool import get_daily_mood
 from panas_scorer import quick_score, build_mood_snapshot
 from board import init_board, board_write, board_read, board_mark_read, board_delete
@@ -65,6 +65,7 @@ from thought_pool import ThoughtPool
 from wallet import init_wallet, wallet_add, wallet_read, wallet_delete
 from progress import init_progress, progress_add, progress_update, progress_read, progress_delete
 from reading_log import init_reading_log, reading_log_add, reading_log_update, reading_log_read, reading_log_delete
+from raw_archive import RawArchive
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -118,6 +119,7 @@ init_wallet(_buckets_dir)
 init_progress(_buckets_dir)
 init_reading_log(_buckets_dir)
 thought_pool = ThoughtPool(_buckets_dir)
+raw_archive = RawArchive(os.path.join(_buckets_dir, "raw_archive.db"))
 
 # --- Night-Fall auto-surface hook (set by register_night_fall if installed) ---
 _night_fall_auto_surface = None
@@ -428,6 +430,143 @@ async def dream_hook(request):
         return PlainTextResponse(body_text)
     except Exception as e:
         logger.warning(f"Dream hook failed: {e}")
+        return PlainTextResponse("")
+
+
+# =============================================================
+# /prompt-hook endpoint: UserPromptSubmit hook — real-time memory injection
+# 用户发消息时触发，注入相关记忆片段（轻量，无 LLM 调用）
+# =============================================================
+@mcp.custom_route("/prompt-hook", methods=["GET"])
+async def prompt_hook(request):
+    from starlette.responses import PlainTextResponse
+    query = request.query_params.get("q", "").strip()
+    if len(query) < 5:
+        return PlainTextResponse("")
+    try:
+        matches = await bucket_mgr.search(query, limit=5)
+        parts = []
+        token_budget = 1500
+        for b in matches:
+            if b.get("score", 0) < 0.25:
+                continue
+            meta = b.get("metadata", {})
+            if meta.get("domain") == "feel":
+                continue
+            # Skip portrait buckets — they're injected separately via /portrait-hook
+            tags = meta.get("tags", [])
+            if "用户画像" in tags or "portrait" in tags:
+                continue
+            preview = strip_wikilinks(b.get("content", ""))[:300]
+            name = meta.get("name", b["id"])
+            entry = f"[{name}]\n{preview}"
+            token_budget -= count_tokens_approx(entry)
+            if token_budget < 0:
+                break
+            parts.append(entry)
+        # --- Graph diffusion: one-hop tag expansion ---
+        # Find buckets sharing ≥2 tags with any matched bucket (exclude already matched)
+        if parts and token_budget > 200:
+            matched_ids = {b["id"] for b in matches if b.get("score", 0) >= 0.25}
+            tag_union: set = set()
+            for b in matches:
+                if b.get("score", 0) >= 0.25:
+                    tag_union.update(b["metadata"].get("tags", []))
+            tag_union.discard("用户画像")
+            tag_union.discard("portrait")
+            if tag_union:
+                try:
+                    all_buckets = await bucket_mgr.list_all(include_archive=False)
+                    neighbors = []
+                    for b in all_buckets:
+                        if b["id"] in matched_ids:
+                            continue
+                        b_tags = set(b["metadata"].get("tags", []))
+                        overlap = len(b_tags & tag_union)
+                        if overlap >= 2:
+                            neighbors.append((overlap, b))
+                    neighbors.sort(key=lambda x: x[0], reverse=True)
+                    for _, nb in neighbors[:1]:
+                        nb_name = nb["metadata"].get("name", nb["id"])
+                        nb_preview = strip_wikilinks(nb.get("content", ""))[:200]
+                        nb_entry = f"[图邻居·{nb_name}]\n{nb_preview}"
+                        if count_tokens_approx(nb_entry) <= token_budget:
+                            parts.append(nb_entry)
+                            break
+                except Exception as e:
+                    logger.warning(f"Graph diffusion failed: {e}")
+
+        if not parts:
+            return PlainTextResponse("")
+        body = "💭 [浮现相关记忆]\n" + "\n---\n".join(parts)
+        return PlainTextResponse(body)
+    except Exception as e:
+        logger.warning(f"Prompt hook failed: {e}")
+        return PlainTextResponse("")
+
+
+# =============================================================
+# /summary-hook endpoint: Sparse milestone summary — top-N important buckets
+# 稀疏摘要钩子，按 importance 降序返回高权重桶，无 LLM 调用，供每 N 轮注入一次
+# =============================================================
+@mcp.custom_route("/summary-hook", methods=["GET"])
+async def summary_hook(request):
+    from starlette.responses import PlainTextResponse
+    try:
+        importance_min = int(request.query_params.get("min", 7))
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        candidates = [
+            b for b in all_buckets
+            if int(b["metadata"].get("importance", 0)) >= importance_min
+            and b["metadata"].get("type") not in ("feel",)
+            and not b["metadata"].get("pinned")
+            and not ("用户画像" in b["metadata"].get("tags", []) or "portrait" in b["metadata"].get("tags", []))
+        ]
+        candidates.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
+        candidates = candidates[:8]
+        if not candidates:
+            return PlainTextResponse("")
+        parts = []
+        for b in candidates:
+            name = b["metadata"].get("name", b["id"])
+            imp = b["metadata"].get("importance", 0)
+            preview = strip_wikilinks(b.get("content", ""))[:150]
+            parts.append(f"[{name}] (importance:{imp})\n{preview}")
+        body = "[对话快照]\n" + "\n---\n".join(parts)
+        return PlainTextResponse(body)
+    except Exception as e:
+        logger.warning(f"Summary hook failed: {e}")
+        return PlainTextResponse("")
+
+
+# =============================================================
+# /portrait-hook endpoint: Always-on persona & relationship portrait injection
+# 每次对话注入固定的用户画像（pinned buckets），无 LLM 调用，速度快
+# =============================================================
+@mcp.custom_route("/portrait-hook", methods=["GET"])
+async def portrait_hook(request):
+    from starlette.responses import PlainTextResponse
+    try:
+        all_buckets = await bucket_mgr.list_all(include_archive=False)
+        # Only return buckets explicitly tagged as portrait — never dump all pinned
+        portrait_buckets = [
+            b for b in all_buckets
+            if "用户画像" in b["metadata"].get("tags", [])
+            or "portrait" in b["metadata"].get("tags", [])
+            or b["metadata"].get("domain") == "portrait"
+        ]
+        if not portrait_buckets:
+            return PlainTextResponse("")
+        parts = []
+        for b in portrait_buckets:
+            meta = b.get("metadata", {})
+            name = meta.get("name", b["id"])
+            preview = strip_wikilinks(b.get("content", ""))[:600]
+            parts.append(f"[{name}]\n{preview}")
+        body = "🪞 [用户画像]\n" + "\n---\n".join(parts)
+        return PlainTextResponse(body)
+    except Exception as e:
+        logger.warning(f"Portrait hook failed: {e}")
         return PlainTextResponse("")
 
 
@@ -1027,6 +1166,26 @@ async def grow(content: str) -> str:
 
 
 # =============================================================
+# Tool: comment — Append a comment to an existing bucket (year ring)
+# 工具：comment — 在已有桶上追加批注（年轮）
+# =============================================================
+@mcp.tool()
+async def comment(bucket_id: str, content: str) -> str:
+    """在已有桶上追加一条批注（年轮）。不覆盖原内容，只在 comments 列表里新增一条。"""
+    await decay_engine.ensure_started()
+    bucket = await bucket_mgr.get(bucket_id)
+    if not bucket:
+        return f"找不到桶 {bucket_id}。"
+    ts = now_iso()
+    entry = f"[{ts}] {content}"
+    ok = await bucket_mgr.update(bucket_id, append_comment=entry)
+    if ok:
+        name = bucket["metadata"].get("name", bucket_id)
+        return f"已在「{name}」上添加年轮批注。"
+    return "批注写入失败。"
+
+
+# =============================================================
 # Tool 4: trace — Trace, redraw the outline of a memory
 # 工具 4：trace — 描摹，重新勾勒记忆的轮廓
 # Also handles deletion (delete=True)
@@ -1045,9 +1204,10 @@ async def trace(
     pinned: int = -1,
     digested: int = -1,
     content: str = "",
+    confirm_overwrite: bool = False,
     delete: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。"""
+    """修改记忆元数据或内容。resolved=1沉底/0激活,pinned=1钉选/0取消,digested=1隐藏(保留但不浮现)/0取消隐藏,content=替换桶正文(必须同时传confirm_overwrite=True),delete=True删除。只传需改的,-1或空=不改。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1086,6 +1246,13 @@ async def trace(
     if digested in (0, 1):
         updates["digested"] = bool(digested)
     if content:
+        if not confirm_overwrite:
+            current_content = bucket.get("content", "")
+            preview = current_content[:300] + ("…" if len(current_content) > 300 else "")
+            return (
+                f"⚠️ content 参数会整体覆盖桶正文，请确认后重新调用并传 confirm_overwrite=True。\n"
+                f"当前正文预览（共{len(current_content)}字）：\n{preview}"
+            )
         updates["content"] = content
 
     if not updates:
@@ -2468,6 +2635,88 @@ async def api_reading_data(request):
         return JSONResponse(reading_log_read(limit=50))
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
+# Raw Archive — HTTP store endpoint + MCP search tool
+# 原文存档 —— HTTP 存入端点 + MCP 检索工具
+# =============================================================
+
+_RAW_ARCHIVE_API_KEY = os.environ.get("OMBRE_API_KEY", "").strip()
+
+
+def _raw_auth_ok(request) -> bool:
+    """Accept requests that carry a valid Bearer token (if OMBRE_API_KEY is set)."""
+    if not _RAW_ARCHIVE_API_KEY:
+        return True  # no key configured → open
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip() == _RAW_ARCHIVE_API_KEY
+    return False
+
+
+@mcp.custom_route("/raw-archive", methods=["POST"])
+async def raw_archive_store(request):
+    """
+    Store a raw message.
+    Body JSON: {role, content, conv_id?, ts?}
+    Auth: Bearer <OMBRE_API_KEY> (if key is set)
+    """
+    from starlette.responses import JSONResponse
+    if not _raw_auth_ok(request):
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+    role = body.get("role", "").strip()
+    content = body.get("content", "").strip()
+    if not role or not content:
+        return JSONResponse({"error": "role and content required"}, status_code=400)
+    conv_id = body.get("conv_id", "")
+    ts = body.get("ts", None)
+    try:
+        msg_id = raw_archive.store(role=role, content=content, conv_id=conv_id, ts=ts)
+        return JSONResponse({"ok": True, "id": msg_id})
+    except Exception as e:
+        logger.error(f"raw_archive store error: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/raw-archive/stats", methods=["GET"])
+async def raw_archive_stats_endpoint(request):
+    """Return raw archive stats (auth required)."""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        return JSONResponse(raw_archive.stats())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.tool()
+async def search_raw(
+    query: str,
+    limit: int = 20,
+    role: str = "",
+) -> str:
+    """在原文存档里精确检索原话。query=搜索词，limit=最多返回条数(默认20)，role=user/assistant/空(不过滤)。返回最新优先的匹配消息列表。"""
+    if not query.strip():
+        stats = raw_archive.stats()
+        return f"原文存档共 {stats['total']} 条消息（加密：{stats['encrypted']}）。传 query 参数开始检索。"
+    results = raw_archive.search(query=query.strip(), limit=min(limit, 50), role=role.strip())
+    if not results:
+        return f"没找到包含「{query}」的原始消息。"
+    lines = []
+    for r in results:
+        from datetime import datetime, timezone
+        dt = datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        role_tag = r["role"]
+        lines.append(f"[{dt}] [{role_tag}] {r['content']}")
+    header = f"找到 {len(results)} 条包含「{query}」的原始消息（最新优先）："
+    return header + "\n\n" + "\n---\n".join(lines)
 
 
 # --- Entry point / 启动入口 ---
