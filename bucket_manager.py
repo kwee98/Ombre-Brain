@@ -285,6 +285,12 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = max(0.0, min(1.0, float(kwargs["model_valence"])))
+        if "append_comment" in kwargs:
+            existing = post.get("comments", [])
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(kwargs["append_comment"])
+            post["comments"] = existing
 
         # --- Auto-refresh activation time / 自动刷新激活时间 ---
         post["last_active"] = now_iso()

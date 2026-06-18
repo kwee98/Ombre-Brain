@@ -1875,8 +1875,8 @@ async def reading_log_tool(
 @mcp.tool()
 async def briefing() -> str:
     """
-    一键综述：读取今日心情、小金库余额、进度看板概况、未读留言数、书单概况。
-    适合对话开始时快速了解现状。
+    冷启动综述：状态概况 + OmbreBrain 记忆快照（pinned 准则、重要记忆、最近 feel）。
+    替代开窗时的 breath(domain="feel") + breath(importance_min=8)，减少启动 MCP 调用次数。
     """
     try:
         lines = ["══ 小克日报 ══"]
@@ -1903,7 +1903,6 @@ async def briefing() -> str:
             todo = len(board_data.get("todo", []))
             done = len(board_data.get("done", []))
             lines.append(f"📚 备考进度：进行中 {doing} | 卡壳 {blocked} | 待开始 {todo} | 完成 {done}")
-            # 列出进行中的任务
             for i in board_data.get("doing", []):
                 lines.append(f"   ▶ {i['title']}")
             for i in board_data.get("blocked", []):
@@ -1928,6 +1927,48 @@ async def briefing() -> str:
             reading_now = reading_log_read(status="在读", limit=5)
             if reading_now:
                 lines.append(f"📖 在读：" + "、".join(f"《{b['title']}》" for b in reading_now))
+        except Exception:
+            pass
+
+        # 6. OmbreBrain 记忆快照（替代开窗时的两次 breath 调用）
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+
+            pinned = [
+                b for b in all_buckets
+                if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            ]
+            important = [
+                b for b in all_buckets
+                if int(b["metadata"].get("importance", 0)) >= 8
+                and not b["metadata"].get("pinned")
+                and not b["metadata"].get("protected")
+                and b["metadata"].get("type") not in ("feel",)
+            ][:6]
+            feels = sorted(
+                [b for b in all_buckets if b["metadata"].get("type") == "feel"],
+                key=lambda b: b["metadata"].get("created", ""),
+                reverse=True,
+            )[:3]
+
+            if pinned or important or feels:
+                lines.append("\n══ 记忆快照 ══")
+
+            for b in pinned:
+                name = b["metadata"].get("name", b["id"])
+                snippet = strip_wikilinks(b["content"])[:150].replace("\n", " ").strip()
+                lines.append(f"📌 {name}：{snippet}")
+
+            for b in important:
+                name = b["metadata"].get("name", b["id"])
+                imp = b["metadata"].get("importance", "?")
+                snippet = strip_wikilinks(b["content"])[:120].replace("\n", " ").strip()
+                lines.append(f"⚡ [importance={imp}] {name}：{snippet}")
+
+            for f in feels:
+                created = f["metadata"].get("created", "")[:10]
+                snippet = strip_wikilinks(f["content"])[:200].replace("\n", " ").strip()
+                lines.append(f"💙 [{created}] {snippet}")
         except Exception:
             pass
 

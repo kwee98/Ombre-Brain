@@ -393,8 +393,12 @@ class Dehydrator:
                 if parts:
                     header += f" [感官:{' | '.join(parts)}]"
             header += "\n"
-        
+
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+        comments = (metadata or {}).get("comments", [])
+        if comments and isinstance(comments, list):
+            comment_lines = "\n".join(f"  • {c}" for c in comments)
+            content += f"\n[年轮批注]\n{comment_lines}"
         return f"{header}{content}"
 
     # ---------------------------------------------------------
