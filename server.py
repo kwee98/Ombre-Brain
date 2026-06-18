@@ -120,6 +120,7 @@ init_progress(_buckets_dir)
 init_reading_log(_buckets_dir)
 thought_pool = ThoughtPool(_buckets_dir)
 raw_archive = RawArchive(os.path.join(_buckets_dir, "raw_archive.db"))
+raw_archive.set_embedding_engine(embedding_engine)
 
 # --- Night-Fall auto-surface hook (set by register_night_fall if installed) ---
 _night_fall_auto_surface = None
@@ -2718,6 +2719,8 @@ async def raw_archive_store(request):
     ts = body.get("ts", None)
     try:
         msg_id = raw_archive.store(role=role, content=content, conv_id=conv_id, ts=ts)
+        # Fire-and-forget embedding (don't block the response)
+        asyncio.create_task(raw_archive.embed_msg(msg_id, content))
         return JSONResponse({"ok": True, "id": msg_id})
     except Exception as e:
         logger.error(f"raw_archive store error: {e}")
@@ -2742,22 +2745,52 @@ async def search_raw(
     query: str,
     limit: int = 20,
     role: str = "",
+    mode: str = "auto",
 ) -> str:
-    """在原文存档里精确检索原话。query=搜索词，limit=最多返回条数(默认20)，role=user/assistant/空(不过滤)。返回最新优先的匹配消息列表。"""
+    """在原文存档里检索原话。
+query=搜索词，limit=最多返回条数(默认20)，role=user/assistant/空(不过滤)。
+mode: "auto"=优先语义搜索，无结果时降级精确检索；"semantic"=纯语义；"exact"=纯精确子串。
+返回最相关/最新的匹配消息列表。"""
+    from datetime import datetime, timezone
+
     if not query.strip():
         stats = raw_archive.stats()
-        return f"原文存档共 {stats['total']} 条消息（加密：{stats['encrypted']}）。传 query 参数开始检索。"
-    results = raw_archive.search(query=query.strip(), limit=min(limit, 50), role=role.strip())
-    if not results:
-        return f"没找到包含「{query}」的原始消息。"
-    lines = []
-    for r in results:
-        from datetime import datetime, timezone
-        dt = datetime.fromtimestamp(r["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        role_tag = r["role"]
-        lines.append(f"[{dt}] [{role_tag}] {r['content']}")
-    header = f"找到 {len(results)} 条包含「{query}」的原始消息（最新优先）："
-    return header + "\n\n" + "\n---\n".join(lines)
+        return (
+            f"原文存档共 {stats['total']} 条消息（加密：{stats['encrypted']}），"
+            f"已生成 embedding：{stats.get('embeddings', 0)} 条。传 query 参数开始检索。"
+        )
+
+    q = query.strip()
+    lim = min(limit, 50)
+    r = role.strip()
+
+    def _format(results: list[dict], label: str) -> str:
+        lines = []
+        for item in results:
+            dt = datetime.fromtimestamp(item["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            sim_tag = f" [sim={item['similarity']:.3f}]" if "similarity" in item else ""
+            lines.append(f"[{dt}] [{item['role']}]{sim_tag} {item['content']}")
+        return f"{label}（{len(results)} 条）：\n\n" + "\n---\n".join(lines)
+
+    if mode == "exact":
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"没找到包含「{q}」的原始消息。"
+        return _format(results, f"精确匹配「{q}」")
+
+    if mode in ("auto", "semantic"):
+        sem_results = await raw_archive.search_semantic(query=q, top_k=lim, role=r)
+        if sem_results:
+            return _format(sem_results, f"语义搜索「{q}」")
+        if mode == "semantic":
+            return f"语义搜索未找到相关消息（embedding 库可能为空或引擎未启用）。"
+        # auto: fall back to exact
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"语义和精确检索都没找到「{q}」相关的原始消息。"
+        return _format(results, f"精确匹配「{q}」（语义引擎未命中，降级）")
+
+    return f"未知 mode={mode}，请传 auto/semantic/exact。"
 
 
 # --- Entry point / 启动入口 ---

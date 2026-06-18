@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import sqlite3
 import logging
@@ -31,6 +33,7 @@ except ImportError:
 class RawArchive:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self._embed_engine = None  # injected via set_embedding_engine()
         raw_key = os.environ.get("OMBRE_RAW_KEY", "").strip()
         if raw_key and _HAS_FERNET:
             try:
@@ -44,6 +47,9 @@ class RawArchive:
             if not raw_key:
                 logger.info("RawArchive: 未设置 OMBRE_RAW_KEY，以明文存储")
         self._init_db()
+
+    def set_embedding_engine(self, engine) -> None:
+        self._embed_engine = engine
 
     def _init_db(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -63,6 +69,12 @@ class RawArchive:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_raw_role ON raw_messages(role)"
             )
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS raw_embeddings (
+                    msg_id    INTEGER PRIMARY KEY,
+                    embedding TEXT    NOT NULL
+                )
+            """)
             conn.commit()
 
     # ------------------------------------------------------------------
@@ -145,6 +157,114 @@ class RawArchive:
         return results
 
     # ------------------------------------------------------------------
+    # Embedding / Semantic Search
+    # ------------------------------------------------------------------
+
+    async def embed_msg(self, msg_id: int, content: str) -> bool:
+        """Generate and store embedding for a raw message. Fire-and-forget safe."""
+        if not self._embed_engine or not getattr(self._embed_engine, "enabled", False):
+            return False
+        try:
+            vec = await self._embed_engine._generate_embedding(content)
+            if not vec:
+                return False
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO raw_embeddings (msg_id, embedding) VALUES (?,?)",
+                    (msg_id, json.dumps(vec)),
+                )
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.warning(f"raw embed failed for msg {msg_id}: {e}")
+            return False
+
+    async def search_semantic(
+        self,
+        query: str,
+        top_k: int = 10,
+        role: str = "",
+    ) -> list[dict]:
+        """语义搜索：生成 query 向量，与已存 embedding 计算余弦相似度，返回最相关的消息。"""
+        if not self._embed_engine or not getattr(self._embed_engine, "enabled", False):
+            return []
+        try:
+            q_vec = await self._embed_engine._generate_embedding(query)
+            if not q_vec:
+                return []
+        except Exception as e:
+            logger.warning(f"semantic query embed failed: {e}")
+            return []
+
+        with sqlite3.connect(self.db_path) as conn:
+            emb_rows = conn.execute(
+                "SELECT msg_id, embedding FROM raw_embeddings"
+            ).fetchall()
+
+        if not emb_rows:
+            return []
+
+        scored: list[tuple[int, float]] = []
+        for msg_id, emb_json in emb_rows:
+            try:
+                vec = json.loads(emb_json)
+                dot = sum(x * y for x, y in zip(q_vec, vec))
+                na = math.sqrt(sum(x * x for x in q_vec))
+                nb = math.sqrt(sum(x * x for x in vec))
+                sim = dot / (na * nb) if na and nb else 0.0
+                scored.append((msg_id, sim))
+            except Exception:
+                continue
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_ids = [mid for mid, _ in scored[:top_k]]
+        if not top_ids:
+            return []
+
+        placeholders = ",".join("?" * len(top_ids))
+        with sqlite3.connect(self.db_path) as conn:
+            if role:
+                db_rows = conn.execute(
+                    f"SELECT id, conv_id, role, content, created_at, encrypted"
+                    f" FROM raw_messages WHERE id IN ({placeholders}) AND role=?",
+                    top_ids + [role],
+                ).fetchall()
+            else:
+                db_rows = conn.execute(
+                    f"SELECT id, conv_id, role, content, created_at, encrypted"
+                    f" FROM raw_messages WHERE id IN ({placeholders})",
+                    top_ids,
+                ).fetchall()
+
+        msg_map: dict[int, dict] = {}
+        for mid, conv_id, msg_role, blob, ts, enc in db_rows:
+            try:
+                if enc:
+                    if not self.fernet:
+                        continue
+                    text = self.fernet.decrypt(bytes(blob)).decode()
+                else:
+                    text = bytes(blob).decode()
+                msg_map[mid] = {
+                    "id": mid,
+                    "conv_id": conv_id,
+                    "role": msg_role,
+                    "content": text,
+                    "created_at": ts,
+                }
+            except Exception:
+                continue
+
+        sim_map = {mid: sim for mid, sim in scored}
+        results = []
+        for mid, _ in scored[:top_k]:
+            if mid in msg_map:
+                entry = dict(msg_map[mid])
+                entry["similarity"] = round(sim_map[mid], 4)
+                results.append(entry)
+        return results
+
+    # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
 
@@ -161,8 +281,12 @@ class RawArchive:
             by_role = conn.execute(
                 "SELECT role, COUNT(*) FROM raw_messages GROUP BY role"
             ).fetchall()
+            emb_count = conn.execute(
+                "SELECT COUNT(*) FROM raw_embeddings"
+            ).fetchone()[0]
         return {
             "total": total,
             "encrypted": enc,
             "by_role": {r: c for r, c in by_role},
+            "embeddings": emb_count,
         }
