@@ -758,7 +758,11 @@ class BucketManager:
                   # 表示「最后一次合并是 hold 还是 grow 触发的」。
                   # _pre_anchor_source_tool 是 anchor 时保存的原始 source_tool，
                   # release 时自动恢复；None 表示删除该字段。
-                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool"):
+                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool",
+                  # belief 层：confidence/support/contradiction 直接透传。
+                  # ⚠️ 2026-07-03 的 2.4 部署曾丢过这三个字段 → believe() 修订
+                  # 静默丢 confidence（7-03 后的 belief 桶字段缺失）。三方合流补回。
+                  "confidence", "support", "contradiction"):
             if k in kwargs:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
