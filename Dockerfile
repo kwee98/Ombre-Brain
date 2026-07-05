@@ -2,32 +2,44 @@
 # Ombre Brain Docker Build
 # Docker 构建文件
 #
-# Build: docker build -t ombre-brain .
-# Run:   docker run -e OMBRE_API_KEY=your-key -p 8000:8000 ombre-brain
+# Build:
+#   docker build -t ombre-brain .
+# 本地运行（最小必填项）:
+#   docker run \
+#     -e OMBRE_COMPRESS_API_KEY=your-llm-key \
+#     -e OMBRE_EMBED_API_KEY=your-gemini-key \
+#     -e OMBRE_DASHBOARD_PASSWORD=xxx \
+#     -p 8000:8000 ombre-brain
+# 推荐用 deploy/docker-compose.yml（开发）或 deploy/docker-compose.user.yml（用户）启动。
 # ============================================================
 
 FROM python:3.12-slim
 
 WORKDIR /app
 
+# Install cloudflared + curl (for downloading cloudflared)
+# 安装 cloudflared（用于 Tunnel 一键管理功能）
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}" \
+       -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared \
+    && apt-get remove -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies first (leverage Docker cache)
 # 先装依赖（利用 Docker 缓存）
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install git (required for pip install from GitHub)
-# 安装 git（pip 从 GitHub 安装需要）
-RUN apt-get update && apt-get install -y --no-install-recommends git \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Night-Fall dream extension
-# 安装梦境扩展
-RUN pip install --no-cache-dir git+https://github.com/ysuu525/Night-Fall.git
-
 # Copy project files / 复制项目文件
-COPY *.py .
-COPY dashboard.html .
-COPY config.example.yaml ./config.yaml
+COPY src/ ./src/
+COPY frontend/ ./frontend/
+COPY VERSION ./VERSION
+COPY config.example.yaml ./config.default.yaml
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
 
 # Persistent mount point: bucket data
 # 持久化挂载点：记忆数据
@@ -37,10 +49,10 @@ VOLUME ["/app/buckets"]
 # 容器场景默认用 streamable-http
 ENV OMBRE_TRANSPORT=streamable-http
 ENV OMBRE_BUCKETS_DIR=/app/buckets
-# Night-Fall integration
-ENV OMBRE_HOME=/app
-ENV NIGHT_FALL_DATA_DIR=/app/buckets/night_fall
+# Embedding 使用 API 后端（Gemini）
+# 必须通过运行时 -e 或 docker-compose environment 传入 OMBRE_EMBED_API_KEY
+ENV OMBRE_EMBED_BACKEND=api
 
 EXPOSE 8000
 
-CMD ["python", "-m", "night_fall.launcher"]
+ENTRYPOINT ["./entrypoint.sh"]
