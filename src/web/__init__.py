@@ -24,6 +24,7 @@ from . import search
 from . import plans
 from . import letters
 from . import hooks
+from . import raw
 from . import buckets
 from . import import_api
 from . import github
@@ -44,6 +45,7 @@ _WEB_MODULES = (
     ("web.plans", plans.register),
     ("web.letters", letters.register),
     ("web.hooks", hooks.register),
+    ("web.raw", raw.register),
     ("web.buckets", buckets.register),
     ("web.import_api", import_api.register),
     ("web.github", github.register),

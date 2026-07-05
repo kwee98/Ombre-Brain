@@ -735,6 +735,14 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = _clamp01(kwargs["model_valence"], _DEFAULT_VALENCE)
+        if "append_comment" in kwargs:
+            # 年轮批注（origin 93277d1 移植）：追加式评论列表，dehydrator
+            # 渲染时以 [年轮批注] 段展示。追加不覆盖——记忆上的年轮只会变多。
+            existing = post.get("comments", [])
+            if not isinstance(existing, list):
+                existing = []
+            existing.append(kwargs["append_comment"])
+            post["comments"] = existing
         # --- Pass-through fields for plan/letter lifecycle ---
         # --- plan/letter/iter1.7 生命周期相关字段直接透传到 frontmatter ---
         # 这一组字段没有「校验/转换」逻辑，给什么写什么。新增字段往这个元组里加即可。

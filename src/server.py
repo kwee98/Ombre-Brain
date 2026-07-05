@@ -8,8 +8,9 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime �
 web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 15 个 MCP 工具：breath/hold/grow/trace/anchor/release/
-  pulse/plan/letter_write/letter_read/dream/I/link/room/believe；每个入口 ≤ 10 行，只负责转发
+- 启动后暴露 17 个 MCP 工具：breath/hold/grow/trace/anchor/release/
+  pulse/plan/letter_write/letter_read/dream/I/link/room/believe/briefing/search_raw；
+  每个入口薄封装，只负责转发（briefing/search_raw 为 2026-07-05 移植回归的内联实现）
 - Dashboard / HTTP 路由全部已拆分到 src/web/<域>.py（每个模块 register(mcp)），
   本文件仅在启动时调用 web.register_all(mcp) 装配；共享依赖见 web/_shared.py
 - 仍保留在本文件：进程启动、引擎初始化、GitHub 后台同步循环、Webhook 推送、
@@ -20,7 +21,7 @@ web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/too
 - 不写 HTTP 路由处理（全在 web/* 下）；不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp/mcp_extra 两个实例 + 15 个 @mcp*.tool() 函数；HTTP 路由在 src/web/*
+对外暴露：mcp/mcp_extra 两个实例 + 17 个 @mcp*.tool() 函数；HTTP 路由在 src/web/*
 ========================================
 """
 
@@ -228,6 +229,14 @@ decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引�
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)              # Migrate engine / 记忆包迁移引擎
 
+# --- Raw Archive / 原文存档（2026-07-05 三方合流移植回归）---
+# 2.4 重构时该模块被漏掉：/raw-archive 404、search_raw 工具消失、原文归档
+# 静默中断两天（数据 buckets/raw_archive.db 完好）。模块在 src/raw_archive.py，
+# HTTP 端点在 web/raw.py。加密密钥 OMBRE_RAW_KEY 由 systemd EnvironmentFile 注入。
+from raw_archive import RawArchive
+raw_archive = RawArchive(os.path.join(config.get("buckets_dir", "buckets"), "raw_archive.db"))
+raw_archive.set_embedding_engine(embedding_engine)
+
 # --- GitHub Sync / GitHub 同步 ---
 from github_sync import GitHubSync  # type: ignore
 _gh_cfg = config.get("github_sync", {}) or {}
@@ -350,6 +359,7 @@ _wsh.init_runtime(
     migrate_engine=migrate_engine,
     github_sync_instance=github_sync_instance,
     restart_github_auto_task=_restart_github_auto_task,
+    raw_archive=raw_archive,
 )
 # 启动时把磁盘上的会话装回内存（容器重启不踢登录）。鉴权/会话逻辑全在 web/_shared.py，
 # server.py 自身已无 @mcp.custom_route 路由，只需启动时载入一次会话。
@@ -943,6 +953,126 @@ async def believe(
         args={"claim_len": len(claim), "confidence": confidence},
     )
 
+@mcp_extra.tool()
+async def briefing() -> str:
+    """冷启动综述：记忆库状态概况 + 记忆快照（pinned 准则、importance≥8 记忆、最近 3 条 feel）。替代开窗时的 breath(domain=\"feel\") + breath(importance_min=8) 两次调用，减少启动 MCP 往返。"""
+    # 2026-07-05 三方合流移植（origin 93277d1）。原版还带小金库/进度看板/书单等
+    # 日报段，那些依赖 2.3 时代的旧模块（已不存在于 2.4），此版只保留
+    # OmbreBrain 部分：状态概况 + 记忆快照——与 CLAUDE.md 开窗流程的用法一致。
+    try:
+        lines = ["══ 冷启动综述 ══"]
+        try:
+            stats = await bucket_mgr.get_stats()
+            lines.append(
+                f"🧠 记忆库：permanent {stats['permanent_count']} · dynamic {stats['dynamic_count']} · "
+                f"feel {stats['feel_count']} · plan {stats['plan_count']} · letter {stats['letter_count']} · "
+                f"archive {stats['archive_count']}"
+                f"（衰减引擎 {'running' if decay_engine.is_running else 'stopped'}）"
+            )
+        except Exception:
+            pass
+
+        # 记忆快照（替代开窗时的两次 breath 调用）—— origin 93277d1 原逻辑
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+
+            pinned = [
+                b for b in all_buckets
+                if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            ]
+            important = [
+                b for b in all_buckets
+                if int(b["metadata"].get("importance", 0) or 0) >= 8
+                and not b["metadata"].get("pinned")
+                and not b["metadata"].get("protected")
+                and b["metadata"].get("type") not in ("feel",)
+            ][:6]
+            feels = sorted(
+                [b for b in all_buckets if b["metadata"].get("type") == "feel"],
+                key=lambda b: b["metadata"].get("created", ""),
+                reverse=True,
+            )[:3]
+
+            if pinned or important or feels:
+                lines.append("\n══ 记忆快照 ══")
+
+            for b in pinned:
+                name = b["metadata"].get("name", b["id"])
+                snippet = strip_wikilinks(b["content"])[:150].replace("\n", " ").strip()
+                lines.append(f"📌 {name}：{snippet}")
+
+            for b in important:
+                name = b["metadata"].get("name", b["id"])
+                imp = b["metadata"].get("importance", "?")
+                snippet = strip_wikilinks(b["content"])[:120].replace("\n", " ").strip()
+                lines.append(f"⚡ [importance={imp}] {name}：{snippet}")
+
+            for f in feels:
+                created = f["metadata"].get("created", "")[:10]
+                snippet = strip_wikilinks(f["content"])[:200].replace("\n", " ").strip()
+                lines.append(f"💙 [{created}] {snippet}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"briefing 失败：{e}"
+
+
+@mcp_extra.tool()
+async def search_raw(
+    query: str,
+    limit: int = 20,
+    role: str = "",
+    mode: str = "auto",
+) -> str:
+    """在原文存档里检索原话。
+query=搜索词，limit=最多返回条数(默认20)，role=user/assistant/空(不过滤)。
+mode: "auto"=优先语义搜索，无结果时降级精确检索；"semantic"=纯语义；"exact"=纯精确子串。
+返回最相关/最新的匹配消息列表。"""
+    # 2026-07-05 三方合流移植（origin 415adf9 原实现，逐行保留）。
+    from datetime import datetime, timezone
+
+    if not query.strip():
+        stats = raw_archive.stats()
+        return (
+            f"原文存档共 {stats['total']} 条消息（加密：{stats['encrypted']}），"
+            f"已生成 embedding：{stats.get('embeddings', 0)} 条。传 query 参数开始检索。"
+        )
+
+    q = query.strip()
+    lim = min(limit, 50)
+    r = role.strip()
+
+    def _format(results: list, label: str) -> str:
+        lines = []
+        for item in results:
+            dt = datetime.fromtimestamp(item["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            sim_tag = f" [sim={item['similarity']:.3f}]" if "similarity" in item else ""
+            lines.append(f"[{dt}] [{item['role']}]{sim_tag} {item['content']}")
+        return f"{label}（{len(results)} 条）：\n\n" + "\n---\n".join(lines)
+
+    if mode == "exact":
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"没找到包含「{q}」的原始消息。"
+        return _format(results, f"精确匹配「{q}」")
+
+    if mode in ("auto", "semantic"):
+        sem_results = await raw_archive.search_semantic(query=q, top_k=lim, role=r)
+        if sem_results:
+            return _format(sem_results, f"语义搜索「{q}」")
+        if mode == "semantic":
+            return "语义搜索未找到相关消息（embedding 库可能为空或引擎未启用）。"
+        # auto: fall back to exact
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"语义和精确检索都没找到「{q}」相关的原始消息。"
+        return _format(results, f"精确匹配「{q}」（语义引擎未命中，降级）")
+
+    return f"未知 mode={mode}，请传 auto/semantic/exact。"
+
+
 @mcp.tool()
 async def dream(window_hours: Optional[int] = 48) -> str:
     """读取最近 window_hours（默认 48h）内有变动的所有记忆桶,用于回顾与消化。
@@ -1007,7 +1137,7 @@ if __name__ == "__main__":
 
     # iter 2.2：合并为单连接器 /mcp。
     # 当初（iter 2.1）拆 /mcp + /mcp-extra 是因为 claude.ai 连接器存在 5 工具上限；
-    # 该上限现已解除，15 个工具全部挂在主实例 mcp 上对外暴露一条 /mcp 即可，
+    # 该上限现已解除，17 个工具全部挂在主实例 mcp 上对外暴露一条 /mcp 即可，
     # 顺带消除「第二个连接器」在 Claude.ai 侧的 OAuth/连接器校验疑难。
     # mcp_extra 仅作历史工具分组容器保留（7 个 @mcp_extra.tool() 注册不动），
     # 这里把它的工具回灌进 mcp，让 stdio / sse / streamable-http 三种 transport 一致。
@@ -1113,7 +1243,7 @@ if __name__ == "__main__":
                     _stop_tunnel()
 
             _app.router.lifespan_context = _combined_lifespan
-            logger.info("MCP 单连接器 /mcp：15 个工具统一对外暴露")
+            logger.info("MCP 单连接器 /mcp：17 个工具统一对外暴露")
         else:
             _app = mcp.sse_app()
         _app.add_middleware(

@@ -715,6 +715,11 @@ class Dehydrator:
         except Exception:
             pass  # 非 JSON 内容直接透传
         content = re.sub(r'\[\[([^\]]+)\]\]', r'\1', content)
+        # 年轮批注（origin 93277d1 移植）：桶上追加过的 comments 附在正文尾部展示
+        comments = (metadata or {}).get("comments", [])
+        if comments and isinstance(comments, list):
+            comment_lines = "\n".join(f"  • {c}" for c in comments)
+            content += f"\n[年轮批注]\n{comment_lines}"
         return f"{header}{content}"
 
     # ---------------------------------------------------------
