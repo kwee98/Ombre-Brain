@@ -165,7 +165,7 @@ class RawArchive:
         if not self._embed_engine or not getattr(self._embed_engine, "enabled", False):
             return False
         try:
-            vec = await self._embed_engine._generate_embedding(content)
+            vec = await self._embed_engine._generate_async(content)
             if not vec:
                 return False
             with sqlite3.connect(self.db_path) as conn:
@@ -189,7 +189,7 @@ class RawArchive:
         if not self._embed_engine or not getattr(self._embed_engine, "enabled", False):
             return []
         try:
-            q_vec = await self._embed_engine._generate_embedding(query)
+            q_vec = await self._embed_engine._generate_async(query)
             if not q_vec:
                 return []
         except Exception as e:

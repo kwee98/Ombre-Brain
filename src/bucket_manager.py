@@ -294,6 +294,29 @@ class BucketManager:
         except Exception as e:
             import logging; logging.getLogger(__name__).warning(f"delete_edge failed: {e}")
 
+    def get_neighbors(self, start_ids: list, max_hops: int = 2, decay: float = 0.5) -> list:
+        """BFS从start_ids出发多跳扩散，返回(neighbor_id, weight)列表，按weight降序。"""
+        seen = set(start_ids)
+        frontier = {sid: 1.0 for sid in start_ids}
+        neighbor_weights: dict = {}
+        for _ in range(max_hops):
+            next_frontier: dict = {}
+            for src_id, src_weight in frontier.items():
+                for edge in self.list_edges(src_id):
+                    target = edge["target_id"]
+                    edge_w = float(edge.get("weight", 1.0))
+                    new_weight = src_weight * decay * edge_w
+                    if target not in seen:
+                        if next_frontier.get(target, 0) < new_weight:
+                            next_frontier[target] = new_weight
+                        if neighbor_weights.get(target, 0) < new_weight:
+                            neighbor_weights[target] = new_weight
+            if not next_frontier:
+                break
+            seen.update(next_frontier.keys())
+            frontier = next_frontier
+        return sorted(neighbor_weights.items(), key=lambda x: x[1], reverse=True)
+
     def _record_v3_bucket_event(
         self,
         action: str,
