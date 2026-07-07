@@ -70,6 +70,7 @@ from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
 from tools import believe as _t_believe
+from tools import night_fall as _t_night_fall
 from tools._common import (
     check_content_size as _check_content_size,
     check_pinned_quota as _check_pinned_quota,
@@ -1083,6 +1084,27 @@ async def dream(window_hours: Optional[int] = 48) -> str:
         _t_dream.dispatch(window_hours=window_hours),
         op="dream",
         args={"window_hours": window_hours},
+    )
+
+
+@mcp.tool()
+async def night_fall(
+    action: Optional[str] = "status",
+    dream_id: Optional[str] = "",
+    window_hours: Optional[int] = 72,
+    valence: Optional[float] = -1,
+    arousal: Optional[float] = -1,
+    force: Optional[bool] = False,
+) -> str:
+    """夜落——生成型梦。action=generate=从最近 window_hours（默认72h）的高情绪记忆生成一场潜伏梦（不返回内容）；surface=评估浮现（传当前 valence/arousal 做共振判定，force=True 跳过潜伏期和共振）；status=看梦池；hold=把浮现过的梦存成 feel 记忆（传 dream_id）。梦潜伏3小时，浮现只发生一次，4次评估没浮上来就自己消失。"""
+    return await _with_notice(
+        _t_night_fall.dispatch(
+            action=action, dream_id=dream_id, window_hours=window_hours,
+            valence=valence, arousal=arousal, force=force,
+        ),
+        op="night_fall",
+        args={"action": action, "dream_id": dream_id, "window_hours": window_hours,
+              "valence": valence, "arousal": arousal, "force": force},
     )
 
 
