@@ -19,7 +19,7 @@ from typing import Optional
 
 from .. import _runtime as rt
 from .candidates import collect_candidates, collect_core_context
-from .hints import build_connection_hint, build_crystal_hint
+from .hints import build_connection_hint, build_crystal_hint, build_constellation_hint
 from .output import format_dream_output
 
 
@@ -40,6 +40,7 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
 
     connection_hint = await build_connection_hint(recent)
     crystal_hint = await build_crystal_hint(all_buckets)
+    constellation_hint = await build_constellation_hint(all_buckets)
 
     final_text = format_dream_output(
         recent=recent,
@@ -47,6 +48,7 @@ async def dispatch(window_hours: Optional[int] = 48) -> str:
         window_hours=window_hours,
         connection_hint=connection_hint,
         crystal_hint=crystal_hint,
+        constellation_hint=constellation_hint,
         core_context=core_context,
     )
 

@@ -254,10 +254,64 @@ async def count_high_importance() -> int:
         return 0
 
 
-async def enforce_high_importance_quota(importance: int) -> int:
-    """importance≥9 配额检查 + 自动降级。
+async def evict_coldest_high_importance() -> str:
+    """腾坑：把最「冷」的一条 importance≥9 非 pinned 桶降级到 _HIGH_IMP_DEGRADE_TO，
+    给新的高重要度记忆让出一个配额位。返回被降级桶的 id；找不到候选则返回 ""。
 
-    - 当前数 ≥ 硬上限 → push OB-I001 并把 importance 降为 _HIGH_IMP_DEGRADE_TO
+    「冷」的判据（按优先级）：
+      1. resolved 的先走——已了结却还占着高位的最该腾；
+      2. activation_count 低——很少被 breath 唤醒的，说明我不常想起它；
+      3. created 早——同样冷时，老的先走。
+    pinned/protected 永不参与（它们本就不计入 count_high_importance）。
+    这让核心区自我维护：稳态是「24 条我最常想起的非 pinned 高重要度记忆」，
+    新记忆进门不再一律打折，而是挤掉一条我早不看的。
+    """
+    try:
+        all_b = await rt.bucket_mgr.list_all(include_archive=False)
+    except Exception as e:
+        rt.logger.warning(f"evict_coldest_high_importance list failed: {e}")
+        return ""
+    candidates = [
+        b for b in all_b
+        if int(b.get("metadata", {}).get("importance") or 0) >= _HIGH_IMP_THRESHOLD
+        and not b.get("metadata", {}).get("pinned")
+        and not b.get("metadata", {}).get("protected")
+    ]
+    if not candidates:
+        return ""
+
+    def _coldness_key(b):
+        meta = b.get("metadata", {})
+        resolved_first = 0 if meta.get("resolved") else 1
+        act = int(meta.get("activation_count") or 0)
+        created = str(meta.get("created") or "")
+        return (resolved_first, act, created)
+
+    candidates.sort(key=_coldness_key)
+    victim = candidates[0]
+    vid = victim.get("id")
+    vmeta = victim.get("metadata", {})
+    try:
+        ok = await rt.bucket_mgr.update(vid, importance=_HIGH_IMP_DEGRADE_TO)
+    except Exception as e:
+        rt.logger.warning(f"evict_coldest_high_importance downgrade {vid} failed: {e}")
+        return ""
+    if not ok:
+        return ""
+    rt.logger.info(
+        f"op=quota phase=evict victim={vid} name={vmeta.get('name')} "
+        f"resolved={bool(vmeta.get('resolved'))} act={vmeta.get('activation_count')} "
+        f"old_imp={vmeta.get('importance')} new_imp={_HIGH_IMP_DEGRADE_TO}"
+    )
+    return vid
+
+
+async def enforce_high_importance_quota(importance: int) -> int:
+    """importance≥9 配额检查 + 自动腾坑/降级。
+
+    - 当前数 ≥ 硬上限 → 先尝试腾坑（沉掉一条最冷的老桶），成功则新桶保留原
+      importance，push OB-I001 说明腾了谁；腾不出（全 pinned/无候选）才退回
+      老行为：把新桶降为 _HIGH_IMP_DEGRADE_TO。
     - 当前数 ≥ 软阈值 → push OB-W003（仅提醒，不动数据）
     返回最终生效的 importance。
     """
@@ -265,13 +319,27 @@ async def enforce_high_importance_quota(importance: int) -> int:
         return importance
     cur = await count_high_importance()
     if cur >= _HIGH_IMP_HARD_CAP:
+        evicted = await evict_coldest_high_importance()
+        if evicted:
+            rt.logger.info(
+                f"op=quota phase=branch branch=imp_evict requested={importance} "
+                f"current={cur} cap={_HIGH_IMP_HARD_CAP} evicted={evicted}"
+            )
+            _push_warning_safe(
+                "OB-I001",
+                f"importance≥{_HIGH_IMP_THRESHOLD} 已达硬上限 {_HIGH_IMP_HARD_CAP}，"
+                f"已自动沉掉最冷的一条老桶（{evicted} → importance {_HIGH_IMP_DEGRADE_TO}）腾出位置，"
+                f"本桶保留 importance={importance}",
+            )
+            return importance
         rt.logger.info(
             f"op=quota phase=branch branch=imp_degrade requested={importance} "
             f"current={cur} cap={_HIGH_IMP_HARD_CAP} degraded_to={_HIGH_IMP_DEGRADE_TO}"
         )
         _push_warning_safe(
             "OB-I001",
-            f"当前已有 {cur} 条 importance≥{_HIGH_IMP_THRESHOLD}（硬上限 {_HIGH_IMP_HARD_CAP}），新桶 importance 自动降级为 {_HIGH_IMP_DEGRADE_TO}",
+            f"当前已有 {cur} 条 importance≥{_HIGH_IMP_THRESHOLD}（硬上限 {_HIGH_IMP_HARD_CAP}），"
+            f"且无可腾的冷桶，新桶 importance 自动降级为 {_HIGH_IMP_DEGRADE_TO}",
         )
         return _HIGH_IMP_DEGRADE_TO
     if cur >= _HIGH_IMP_SOFT_WARN:

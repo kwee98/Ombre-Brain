@@ -31,6 +31,7 @@ from . import embedding
 from . import ollama_local
 from . import config_api
 from . import v3_debug
+from . import raw
 
 
 _WEB_MODULES = (
@@ -44,6 +45,7 @@ _WEB_MODULES = (
     ("web.plans", plans.register),
     ("web.letters", letters.register),
     ("web.hooks", hooks.register),
+    ("web.raw", raw.register),
     ("web.buckets", buckets.register),
     ("web.import_api", import_api.register),
     ("web.github", github.register),

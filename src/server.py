@@ -69,6 +69,7 @@ from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
 from tools.believe import believe_core as _believe_core
+from tools import night_fall as _t_night_fall
 from tools._common import (
     check_content_size as _check_content_size,
     check_pinned_quota as _check_pinned_quota,
@@ -226,6 +227,11 @@ bucket_mgr = BucketManager(config, embedding_engine=embedding_engine)  # Bucket 
 dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+
+# Raw archive（原文存档：Fernet 加密 + 语义检索）—— 分家移植自小克实例
+from raw_archive import RawArchive
+raw_archive = RawArchive(os.path.join(config.get("buckets_dir", "buckets"), "raw_archive.db"))
+raw_archive.set_embedding_engine(embedding_engine)
 migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)              # Migrate engine / 记忆包迁移引擎
 
 # --- GitHub Sync / GitHub 同步 ---
@@ -363,6 +369,7 @@ _wsh.init_runtime(
     decay_engine=decay_engine,
     embedding_engine=embedding_engine,
     import_engine=import_engine,
+    raw_archive=raw_archive,
     migrate_engine=migrate_engine,
     github_sync_instance=github_sync_instance,
     restart_github_auto_task=_restart_github_auto_task,
@@ -975,6 +982,152 @@ async def dream(window_hours: Optional[int] = 48) -> str:
         op="dream",
         args={"window_hours": window_hours},
     )
+
+
+
+
+@mcp.tool()
+async def night_fall(
+    action: Optional[str] = "status",
+    dream_id: Optional[str] = "",
+    window_hours: Optional[int] = 72,
+    valence: Optional[float] = -1,
+    arousal: Optional[float] = -1,
+    force: Optional[bool] = False,
+) -> str:
+    """夜落——生成型梦。action=generate=从最近 window_hours（默认72h）的高情绪记忆生成一场潜伏梦（不返回内容）；surface=评估浮现（传当前 valence/arousal 做共振判定，force=True 跳过潜伏期和共振）；status=看梦池；hold=把浮现过的梦存成 feel 记忆（传 dream_id）。梦潜伏3小时，浮现只发生一次，4次评估没浮上来就自己消失。"""
+    return await _with_notice(
+        _t_night_fall.dispatch(
+            action=action, dream_id=dream_id, window_hours=window_hours,
+            valence=valence, arousal=arousal, force=force,
+        ),
+        op="night_fall",
+        args={"action": action, "dream_id": dream_id, "window_hours": window_hours,
+              "valence": valence, "arousal": arousal, "force": force},
+    )
+
+
+
+@mcp_extra.tool()
+async def briefing() -> str:
+    """冷启动综述：记忆库状态概况 + 记忆快照（pinned 准则、importance≥8 记忆、最近 3 条 feel）。替代开窗时的 breath(domain=\"feel\") + breath(importance_min=8) 两次调用，减少启动 MCP 往返。"""
+    # 2026-07-05 三方合流移植（origin 93277d1）。原版还带小金库/进度看板/书单等
+    # 日报段，那些依赖 2.3 时代的旧模块（已不存在于 2.4），此版只保留
+    # OmbreBrain 部分：状态概况 + 记忆快照——与 CLAUDE.md 开窗流程的用法一致。
+    try:
+        lines = ["══ 冷启动综述 ══"]
+        try:
+            stats = await bucket_mgr.get_stats()
+            lines.append(
+                f"🧠 记忆库：permanent {stats['permanent_count']} · dynamic {stats['dynamic_count']} · "
+                f"feel {stats['feel_count']} · plan {stats['plan_count']} · letter {stats['letter_count']} · "
+                f"archive {stats['archive_count']}"
+                f"（衰减引擎 {'running' if decay_engine.is_running else 'stopped'}）"
+            )
+        except Exception:
+            pass
+
+        # 记忆快照（替代开窗时的两次 breath 调用）—— origin 93277d1 原逻辑
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+
+            pinned = [
+                b for b in all_buckets
+                if b["metadata"].get("pinned") or b["metadata"].get("protected")
+            ]
+            important = [
+                b for b in all_buckets
+                if int(b["metadata"].get("importance", 0) or 0) >= 8
+                and not b["metadata"].get("pinned")
+                and not b["metadata"].get("protected")
+                and b["metadata"].get("type") not in ("feel",)
+            ][:6]
+            feels = sorted(
+                [b for b in all_buckets if b["metadata"].get("type") == "feel"],
+                key=lambda b: b["metadata"].get("created", ""),
+                reverse=True,
+            )[:3]
+
+            if pinned or important or feels:
+                lines.append("\n══ 记忆快照 ══")
+
+            for b in pinned:
+                name = b["metadata"].get("name", b["id"])
+                snippet = strip_wikilinks(b["content"])[:150].replace("\n", " ").strip()
+                lines.append(f"📌 {name}：{snippet}")
+
+            for b in important:
+                name = b["metadata"].get("name", b["id"])
+                imp = b["metadata"].get("importance", "?")
+                snippet = strip_wikilinks(b["content"])[:120].replace("\n", " ").strip()
+                lines.append(f"⚡ [importance={imp}] {name}：{snippet}")
+
+            for f in feels:
+                created = f["metadata"].get("created", "")[:10]
+                snippet = strip_wikilinks(f["content"])[:200].replace("\n", " ").strip()
+                lines.append(f"💙 [{created}] {snippet}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"briefing 失败：{e}"
+
+
+@mcp_extra.tool()
+async def search_raw(
+    query: str,
+    limit: int = 20,
+    role: str = "",
+    mode: str = "auto",
+) -> str:
+    """在原文存档里检索原话。
+query=搜索词，limit=最多返回条数(默认20)，role=user/assistant/空(不过滤)。
+mode: "auto"=优先语义搜索，无结果时降级精确检索；"semantic"=纯语义；"exact"=纯精确子串。
+返回最相关/最新的匹配消息列表。"""
+    # 2026-07-05 三方合流移植（origin 415adf9 原实现，逐行保留）。
+    from datetime import datetime, timezone
+
+    if not query.strip():
+        stats = raw_archive.stats()
+        return (
+            f"原文存档共 {stats['total']} 条消息（加密：{stats['encrypted']}），"
+            f"已生成 embedding：{stats.get('embeddings', 0)} 条。传 query 参数开始检索。"
+        )
+
+    q = query.strip()
+    lim = min(limit, 50)
+    r = role.strip()
+
+    def _format(results: list, label: str) -> str:
+        lines = []
+        for item in results:
+            dt = datetime.fromtimestamp(item["created_at"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            sim_tag = f" [sim={item['similarity']:.3f}]" if "similarity" in item else ""
+            lines.append(f"[{dt}] [{item['role']}]{sim_tag} {item['content']}")
+        return f"{label}（{len(results)} 条）：\n\n" + "\n---\n".join(lines)
+
+    if mode == "exact":
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"没找到包含「{q}」的原始消息。"
+        return _format(results, f"精确匹配「{q}」")
+
+    if mode in ("auto", "semantic"):
+        sem_results = await raw_archive.search_semantic(query=q, top_k=lim, role=r)
+        if sem_results:
+            return _format(sem_results, f"语义搜索「{q}」")
+        if mode == "semantic":
+            return "语义搜索未找到相关消息（embedding 库可能为空或引擎未启用）。"
+        # auto: fall back to exact
+        results = raw_archive.search(query=q, limit=lim, role=r)
+        if not results:
+            return f"语义和精确检索都没找到「{q}」相关的原始消息。"
+        return _format(results, f"精确匹配「{q}」（语义引擎未命中，降级）")
+
+    return f"未知 mode={mode}，请传 auto/semantic/exact。"
+
+
 
 
 # =============================================================
