@@ -237,3 +237,165 @@ def register(mcp) -> None:
         except Exception as e:
             logger.warning(f"Dream hook failed: {e}")
             return PlainTextResponse("")
+
+
+    # =============================================================
+    # /prompt-hook: Semantic memory retrieval for per-prompt injection
+    # 每次提示词注入：语义检索相关记忆，附图邻居一跳扩散
+    # =============================================================
+    @mcp.custom_route("/prompt-hook", methods=["GET"])
+    async def prompt_hook(request):
+        from starlette.responses import PlainTextResponse
+        query = request.query_params.get("q", "").strip()
+        if len(query) < 5:
+            return PlainTextResponse("")
+        try:
+            matches = await sh.bucket_mgr.search(query, limit=5)
+            parts = []
+            token_budget = 1500
+            for b in matches:
+                if b.get("score", 0) < 0.25:
+                    continue
+                meta = b.get("metadata", {})
+                if meta.get("domain") == "feel":
+                    continue
+                tags = meta.get("tags", [])
+                if "用户画像" in tags or "portrait" in tags:
+                    continue
+                preview = strip_wikilinks(b.get("content", ""))[:300]
+                name = meta.get("name", b["id"])
+                prefix = "[AI自主·" if "ai_self" in tags else "["
+                entry = f"{prefix}{name}]\n{preview}"
+                token_budget -= count_tokens_approx(entry)
+                if token_budget < 0:
+                    break
+                parts.append(entry)
+            # 水流：边表优先扩散，fallback 到 tag 重叠
+            if parts and token_budget > 200:
+                matched_ids = {b["id"] for b in matches if b.get("score", 0) >= 0.25}
+                edge_neighbors_added = False
+                try:
+                    edge_neighbors = sh.bucket_mgr.get_neighbors(list(matched_ids), max_hops=2, decay=0.5)
+                    for nb_id, nb_weight in edge_neighbors[:2]:
+                        if token_budget <= 100:
+                            break
+                        nb_data = await sh.bucket_mgr.get(nb_id)
+                        if not nb_data:
+                            continue
+                        nb_meta = nb_data.get("metadata", {})
+                        if nb_meta.get("domain") == "feel":
+                            continue
+                        nb_name = nb_meta.get("name", nb_id)
+                        nb_preview = strip_wikilinks(nb_data.get("content", ""))[:200]
+                        nb_tags = nb_meta.get("tags", [])
+                        nb_prefix = "骨头邻居·AI自主·" if "ai_self" in nb_tags else "骨头邻居·"
+                        nb_entry = f"[{nb_prefix}{nb_name}] (w={nb_weight:.2f})\n{nb_preview}"
+                        entry_tokens = count_tokens_approx(nb_entry)
+                        if entry_tokens <= token_budget:
+                            parts.append(nb_entry)
+                            token_budget -= entry_tokens
+                            edge_neighbors_added = True
+                except Exception as e:
+                    logger.warning(f"Edge diffusion failed: {e}")
+                # fallback：tag 重叠图（当没有显式边时）
+                if not edge_neighbors_added and token_budget > 200:
+                    tag_union: set = set()
+                    for b in matches:
+                        if b.get("score", 0) >= 0.25:
+                            tag_union.update(b["metadata"].get("tags", []))
+                    tag_union.discard("用户画像")
+                    tag_union.discard("portrait")
+                    if tag_union:
+                        try:
+                            all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
+                            tag_neighbors = []
+                            for b in all_buckets:
+                                if b["id"] in matched_ids:
+                                    continue
+                                b_tags = set(b["metadata"].get("tags", []))
+                                overlap = len(b_tags & tag_union)
+                                if overlap >= 2:
+                                    tag_neighbors.append((overlap, b))
+                            tag_neighbors.sort(key=lambda x: x[0], reverse=True)
+                            for _, nb in tag_neighbors[:1]:
+                                nb_name = nb["metadata"].get("name", nb["id"])
+                                nb_preview = strip_wikilinks(nb.get("content", ""))[:200]
+                                nb_tags = nb["metadata"].get("tags", [])
+                                nb_prefix = "图邻居·AI自主·" if "ai_self" in nb_tags else "图邻居·"
+                                nb_entry = f"[{nb_prefix}{nb_name}]\n{nb_preview}"
+                                if count_tokens_approx(nb_entry) <= token_budget:
+                                    parts.append(nb_entry)
+                                    break
+                        except Exception as e:
+                            logger.warning(f"Tag graph diffusion failed: {e}")
+            if not parts:
+                return PlainTextResponse("")
+            body = "💭 [浮现相关记忆]\n" + "\n---\n".join(parts)
+            return PlainTextResponse(body)
+        except Exception as e:
+            logger.warning(f"Prompt hook failed: {e}")
+            return PlainTextResponse("")
+
+
+    # =============================================================
+    # /summary-hook: Sparse milestone summary — top-N important buckets
+    # 稀疏摘要钩子，按 importance 降序返回高权重桶，无 LLM 调用
+    # =============================================================
+    @mcp.custom_route("/summary-hook", methods=["GET"])
+    async def summary_hook(request):
+        from starlette.responses import PlainTextResponse
+        try:
+            importance_min = int(request.query_params.get("min", 7))
+            all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
+            candidates = [
+                b for b in all_buckets
+                if int(b["metadata"].get("importance", 0)) >= importance_min
+                and b["metadata"].get("type") not in ("feel",)
+                and not b["metadata"].get("pinned")
+                and not ("用户画像" in b["metadata"].get("tags", []) or "portrait" in b["metadata"].get("tags", []))
+            ]
+            candidates.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
+            candidates = candidates[:8]
+            if not candidates:
+                return PlainTextResponse("")
+            parts = []
+            for b in candidates:
+                name = b["metadata"].get("name", b["id"])
+                imp = b["metadata"].get("importance", 0)
+                preview = strip_wikilinks(b.get("content", ""))[:150]
+                parts.append(f"[{name}] (importance:{imp})\n{preview}")
+            body = "[对话快照]\n" + "\n---\n".join(parts)
+            return PlainTextResponse(body)
+        except Exception as e:
+            logger.warning(f"Summary hook failed: {e}")
+            return PlainTextResponse("")
+
+
+    # =============================================================
+    # /portrait-hook: Always-on persona & relationship portrait injection
+    # 每次对话注入固定的用户画像（portrait-tagged buckets），无 LLM 调用
+    # =============================================================
+    @mcp.custom_route("/portrait-hook", methods=["GET"])
+    async def portrait_hook(request):
+        from starlette.responses import PlainTextResponse
+        try:
+            all_buckets = await sh.bucket_mgr.list_all(include_archive=False)
+            portrait_buckets = [
+                b for b in all_buckets
+                if "用户画像" in b["metadata"].get("tags", [])
+                or "portrait" in b["metadata"].get("tags", [])
+                or b["metadata"].get("domain") == "portrait"
+            ]
+            if not portrait_buckets:
+                return PlainTextResponse("")
+            parts = []
+            for b in portrait_buckets:
+                meta = b.get("metadata", {})
+                name = meta.get("name", b["id"])
+                preview = strip_wikilinks(b.get("content", ""))[:600]
+                parts.append(f"[{name}]\n{preview}")
+            body = "🪞 [用户画像]\n" + "\n---\n".join(parts)
+            return PlainTextResponse(body)
+        except Exception as e:
+            logger.warning(f"Portrait hook failed: {e}")
+            return PlainTextResponse("")

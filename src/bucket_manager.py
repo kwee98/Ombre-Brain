@@ -32,6 +32,7 @@ import math
 import asyncio
 import logging
 import shutil
+import sqlite3
 import uuid
 from datetime import date, datetime
 
@@ -269,6 +270,116 @@ class BucketManager:
             )
         except Exception as exc:
             logger.warning(f"v3 bucket event record failed for {action}:{bucket_id}: {exc}")
+
+        # 骨头：显式边表（SQLite），与 embeddings.db 同级
+        self._edge_db_path = os.path.join(self.base_dir, "edges.db")
+        self._init_edge_table()
+
+    # ---------------------------------------------------------
+    # 骨头 (Edge store) — 显式记忆图
+    # ---------------------------------------------------------
+
+    def _init_edge_table(self) -> None:
+        """初始化 edges.db，建表（幂等）。"""
+        try:
+            os.makedirs(os.path.dirname(self._edge_db_path), exist_ok=True)
+            conn = sqlite3.connect(self._edge_db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS edges (
+                    source_id  TEXT NOT NULL,
+                    target_id  TEXT NOT NULL,
+                    edge_type  TEXT NOT NULL DEFAULT 'related',
+                    weight     REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (source_id, target_id, edge_type)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Edge table init failed: {e}")
+
+    def add_edge(self, source_id: str, target_id: str, edge_type: str = "related", weight: float = 1.0) -> None:
+        """声明两条记忆之间的有向边，双向各存一条（无向语义）。幂等，重复调用只更新 weight。"""
+        try:
+            ts = now_iso()
+            conn = sqlite3.connect(self._edge_db_path)
+            conn.execute(
+                "INSERT OR REPLACE INTO edges (source_id, target_id, edge_type, weight, created_at) VALUES (?,?,?,?,?)",
+                (source_id, target_id, edge_type, weight, ts)
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO edges (source_id, target_id, edge_type, weight, created_at) VALUES (?,?,?,?,?)",
+                (target_id, source_id, edge_type, weight, ts)
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"add_edge failed ({source_id}→{target_id}): {e}")
+
+    def get_neighbors(self, bucket_ids: list[str], max_hops: int = 2, decay: float = 0.5) -> list[tuple[str, float]]:
+        """
+        沿边表做 BFS，返回 [(neighbor_id, weight)] 按权重降序。
+        第1跳权重 = edge.weight × decay，第2跳再 × decay。
+        排除 bucket_ids 本身。结果去重取最高权重。
+        """
+        if not bucket_ids:
+            return []
+        seen = set(bucket_ids)
+        frontier = {bid: 1.0 for bid in bucket_ids}
+        result: dict[str, float] = {}
+        try:
+            conn = sqlite3.connect(self._edge_db_path)
+            for _ in range(max_hops):
+                if not frontier:
+                    break
+                placeholders = ",".join("?" * len(frontier))
+                rows = conn.execute(
+                    f"SELECT source_id, target_id, weight FROM edges WHERE source_id IN ({placeholders})",
+                    list(frontier.keys())
+                ).fetchall()
+                new_frontier: dict[str, float] = {}
+                for src, tgt, w in rows:
+                    if tgt in seen:
+                        continue
+                    hop_weight = frontier[src] * w * decay
+                    if hop_weight > result.get(tgt, 0.0):
+                        result[tgt] = hop_weight
+                    if hop_weight > new_frontier.get(tgt, 0.0):
+                        new_frontier[tgt] = hop_weight
+                seen.update(new_frontier)
+                frontier = new_frontier
+            conn.close()
+        except Exception as e:
+            logger.warning(f"get_neighbors failed: {e}")
+        return sorted(result.items(), key=lambda x: x[1], reverse=True)
+
+    def list_edges(self, bucket_id: str) -> list[dict]:
+        """返回 bucket_id 的所有边（单向：source=bucket_id），供 dashboard/link 工具展示。"""
+        try:
+            conn = sqlite3.connect(self._edge_db_path)
+            rows = conn.execute(
+                "SELECT target_id, edge_type, weight, created_at FROM edges WHERE source_id=? ORDER BY weight DESC",
+                (bucket_id,)
+            ).fetchall()
+            conn.close()
+            return [{"target_id": r[0], "edge_type": r[1], "weight": r[2], "created_at": r[3]} for r in rows]
+        except Exception as e:
+            logger.warning(f"list_edges failed: {e}")
+            return []
+
+    def delete_edge(self, source_id: str, target_id: str, edge_type: str = "related") -> None:
+        """删除一条边（双向）。"""
+        try:
+            conn = sqlite3.connect(self._edge_db_path)
+            conn.execute("DELETE FROM edges WHERE source_id=? AND target_id=? AND edge_type=?", (source_id, target_id, edge_type))
+            conn.execute("DELETE FROM edges WHERE source_id=? AND target_id=? AND edge_type=?", (target_id, source_id, edge_type))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"delete_edge failed: {e}")
 
     # ---------------------------------------------------------
     # Internal helpers【代码多复用、不作为公共 API】
@@ -726,7 +837,9 @@ class BucketManager:
                   # 表示「最后一次合并是 hold 还是 grow 触发的」。
                   # _pre_anchor_source_tool 是 anchor 时保存的原始 source_tool，
                   # release 时自动恢复；None 表示删除该字段。
-                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool"):
+                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool",
+                  # belief 层：confidence/support/contradiction 直接透传
+                  "confidence", "support", "contradiction"):
             if k in kwargs:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
