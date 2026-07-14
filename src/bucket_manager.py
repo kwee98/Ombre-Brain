@@ -29,7 +29,6 @@ bucket_manager.py — 记忆桶的增删改查与多维索引
 import os
 import re
 import math
-import time
 import logging
 import shutil
 import uuid
@@ -120,12 +119,6 @@ _TRIGGERED_BY_MAX = 64
 _RIPPLE_HOURS = 48.0       # ±该小时内的桶被轻微唤醒
 _RIPPLE_MAX_BUCKETS = 5    # 一次 touch 最多唤醒几个邻居（有界 I/O）
 _RIPPLE_BOOST = 0.3        # 唤醒时 activation_count 增量
-
-# --- 读缓存（iter 2.3）---
-# 全库 frontmatter 解析结果 + id→路径索引的内存缓存。写路径整体失效（与
-# _bm25_dirty 同一 choke point），touch/ripple 精准更新；TTL 兜底外部编辑
-# （Obsidian/手工直改 .md 文件最迟这么多秒后可见）。
-_CACHE_TTL_SECONDS = 60.0
 
 # --- search 评分 ---
 _VECTOR_TOPK = 50          # embedding 预取 top_k（仅作 semantic 分源，不窄化候选集）
@@ -218,13 +211,6 @@ class BucketManager:
         self._bm25: "_BM25Index | None" = _BM25Index() if _BM25Index is not None else None
         self._bm25_dirty: bool = True
 
-        # 读缓存（iter 2.3）：list_all 解析结果 + id→路径索引。
-        # 之前每次 list_all 都全库 frontmatter.load（527 桶 × 一次 breath 21 遍），
-        # 是 breath 秒级延迟的主因。失效见 _invalidate_bm25（同一 choke point）。
-        self._list_cache: "list[dict] | None" = None
-        self._list_cache_at: float = 0.0
-        self._id_index: dict[str, str] = {}
-
         # 骨头：显式边表（SQLite）
         self._edge_db_path = os.path.join(self.base_dir, "edges.db")
         self._init_edge_table()
@@ -293,29 +279,6 @@ class BucketManager:
             conn.close()
         except Exception as e:
             import logging; logging.getLogger(__name__).warning(f"delete_edge failed: {e}")
-
-    def get_neighbors(self, start_ids: list, max_hops: int = 2, decay: float = 0.5) -> list:
-        """BFS从start_ids出发多跳扩散，返回(neighbor_id, weight)列表，按weight降序。"""
-        seen = set(start_ids)
-        frontier = {sid: 1.0 for sid in start_ids}
-        neighbor_weights: dict = {}
-        for _ in range(max_hops):
-            next_frontier: dict = {}
-            for src_id, src_weight in frontier.items():
-                for edge in self.list_edges(src_id):
-                    target = edge["target_id"]
-                    edge_w = float(edge.get("weight", 1.0))
-                    new_weight = src_weight * decay * edge_w
-                    if target not in seen:
-                        if next_frontier.get(target, 0) < new_weight:
-                            next_frontier[target] = new_weight
-                        if neighbor_weights.get(target, 0) < new_weight:
-                            neighbor_weights[target] = new_weight
-            if not next_frontier:
-                break
-            seen.update(next_frontier.keys())
-            frontier = next_frontier
-        return sorted(neighbor_weights.items(), key=lambda x: x[1], reverse=True)
 
     def _record_v3_bucket_event(
         self,
@@ -403,27 +366,8 @@ class BucketManager:
         await self.embedding_engine.generate_and_store(bucket_id, content)
 
     def _invalidate_bm25(self) -> None:
-        """写操作后调用：标记 BM25 需重建，并整体失效读缓存。
-
-        所有低频写路径（create/update/delete/archive；move 经由 update/archive）
-        原本就都调这里，借同一 choke point 保证缓存不会漏失效。
-        touch/_time_ripple 不走这里——它们高频且只改 activation 字段，
-        在各自写盘后对缓存做精准更新（见 _cache_refresh_one）。"""
+        """写操作后调用，标记 BM25 索引需要重建。search() 时懒触发。"""
         self._bm25_dirty = True
-        self._list_cache = None
-        self._id_index.clear()
-
-    def _cache_refresh_one(self, bucket_id: str, file_path: str) -> None:
-        """touch/ripple 专用：重读单个桶，原位替换缓存条目。缓存不在则忽略。"""
-        if self._list_cache is None:
-            return
-        fresh = self._load_bucket(file_path)
-        if not fresh:
-            return
-        for i, b in enumerate(self._list_cache):
-            if b["id"] == bucket_id:
-                self._list_cache[i] = fresh
-                return
 
     # ---------------------------------------------------------
     # Create a new bucket
@@ -449,6 +393,8 @@ class BucketManager:
         source_tool: str = "",
         grow_batch_id: str = "",
         bucket_id_override: str = "",
+        meaning: str = "",
+        media: Optional[list] = None,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -551,6 +497,10 @@ class BucketManager:
         # Empty string = 没说原因，dashboard 直接不渲染该行。
         if why_remembered:
             metadata["why_remembered"] = str(why_remembered).strip()[:_WHY_REMEMBERED_MAX]
+        if meaning:
+            metadata["meaning"] = str(meaning).strip()[:2048]
+        if media:
+            metadata["media"] = list(media)[:20]
         # --- iter 1.8: feel 桶的因果链出口（暂不强校验存在性，只透传） ---
         # triggered_by = 触发这条 feel 的源 bucket_id。1.9 会做 UI 联动。
         if triggered_by:
@@ -758,14 +708,6 @@ class BucketManager:
             post["digested"] = bool(kwargs["digested"])
         if "model_valence" in kwargs:
             post["model_valence"] = _clamp01(kwargs["model_valence"], _DEFAULT_VALENCE)
-        if "append_comment" in kwargs:
-            # 年轮批注（origin 93277d1 移植）：追加式评论列表，dehydrator
-            # 渲染时以 [年轮批注] 段展示。追加不覆盖——记忆上的年轮只会变多。
-            existing = post.get("comments", [])
-            if not isinstance(existing, list):
-                existing = []
-            existing.append(kwargs["append_comment"])
-            post["comments"] = existing
         # --- Pass-through fields for plan/letter lifecycle ---
         # --- plan/letter/iter1.7 生命周期相关字段直接透传到 frontmatter ---
         # 这一组字段没有「校验/转换」逻辑，给什么写什么。新增字段往这个元组里加即可。
@@ -789,11 +731,7 @@ class BucketManager:
                   # 表示「最后一次合并是 hold 还是 grow 触发的」。
                   # _pre_anchor_source_tool 是 anchor 时保存的原始 source_tool，
                   # release 时自动恢复；None 表示删除该字段。
-                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool",
-                  # belief 层：confidence/support/contradiction 直接透传。
-                  # ⚠️ 2026-07-03 的 2.4 部署曾丢过这三个字段 → believe() 修订
-                  # 静默丢 confidence（7-03 后的 belief 桶字段缺失）。三方合流补回。
-                  "confidence", "support", "contradiction"):
+                  "source_tool", "grow_batch_id", "last_merged_by", "_pre_anchor_source_tool"):
             if k in kwargs:
                 if k == "weight" and kwargs[k] is not None:
                     post[k] = _clamp01(kwargs[k], _DEFAULT_VALENCE)
@@ -970,9 +908,6 @@ class BucketManager:
 
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(frontmatter.dumps(post))
-            # touch 高频（每条检索命中一次）：整体失效会让一次 breath 把缓存打穿，
-            # 这里只精准替换该桶的缓存条目。
-            self._cache_refresh_one(bucket_id, file_path)
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -1022,7 +957,6 @@ class BucketManager:
                     post["activation_count"] = round(current_count + _RIPPLE_BOOST, 1)
                     with open(file_path, "w", encoding="utf-8") as f:
                         f.write(frontmatter.dumps(post))
-                    self._cache_refresh_one(bucket["id"], file_path)  # 同 touch：精准更新
                     rippled += 1
                 except Exception as _ripple_exc:
                     logger.warning(
@@ -1317,36 +1251,21 @@ class BucketManager:
         results.sort(key=lambda x: x.get("created", ""), reverse=True)
         return results
 
-    def _scan_dirs(self, dirs: list[str]) -> list[dict]:
-        """磁盘全量解析（原 list_all 的循环体）。"""
-        buckets = []
-        for _root, _fname, file_path in self._iter_md_files(dirs):
-            bucket = self._load_bucket(file_path)
-            if bucket:
-                buckets.append(bucket)
-        return buckets
-
     async def list_all(self, include_archive: bool = False) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
-
-        iter 2.3：不含 archive 的调用走内存缓存（写失效 + TTL 60s 兜底）。
-        返回的是缓存列表本身（不拷贝）——调用方给桶 dict 附加 score 等临时
-        字段是无害残留，下次评分会覆盖；不要在调用方修改 metadata 本体。
-        include_archive=True 是低频路径（pulse 等），保持直读。
         """
+        buckets = []
+        dirs = list(self._active_dirs)
         if include_archive:
-            return self._scan_dirs(list(self._active_dirs) + [self.archive_dir])
+            dirs.append(self.archive_dir)
 
-        now = time.monotonic()
-        if self._list_cache is not None and now - self._list_cache_at <= _CACHE_TTL_SECONDS:
-            return self._list_cache
+        for _root, _fname, file_path in self._iter_md_files(dirs):
+            bucket = self._load_bucket(file_path)
+            if bucket:
+                buckets.append(bucket)
 
-        buckets = self._scan_dirs(list(self._active_dirs))
-        self._list_cache = buckets
-        self._list_cache_at = now
-        self._id_index = {b["id"]: b["path"] for b in buckets}
         return buckets
 
     # ---------------------------------------------------------
@@ -1478,10 +1397,6 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        # iter 2.3：先查 id→路径索引（active 桶 O(1)）；文件被移走则回退全扫。
-        cached_path = self._id_index.get(bucket_id)
-        if cached_path and os.path.exists(cached_path):
-            return cached_path
         # 含 archive：软删除后的桶仍然需要可被内部路径查找。
         dirs = [self.permanent_dir, self.dynamic_dir, self.archive_dir,
                 self.feel_dir, self.plan_dir, self.letter_dir]
@@ -1489,7 +1404,6 @@ class BucketManager:
         for _root, fname, full_path in self._iter_md_files(dirs):
             name_part = fname[:-3]  # remove .md
             if name_part == bucket_id or name_part.endswith(f"_{bucket_id}"):
-                self._id_index[bucket_id] = full_path  # 回填（含 archive 桶）
                 return full_path
             candidates.append(full_path)
         # Fallback: check frontmatter id field (for imported files where filename ≠ id)
@@ -1497,7 +1411,6 @@ class BucketManager:
             try:
                 post = frontmatter.load(full_path)
                 if post.get("id") == bucket_id:
-                    self._id_index[bucket_id] = full_path
                     return full_path
             except Exception:
                 pass

@@ -409,6 +409,8 @@ async def merge_or_create(
     why_remembered: str = "",
     source_tool: str = "",
     grow_batch_id: str = "",
+    meaning: str = "",
+    media: list | None = None,
 ) -> Tuple[str, bool, str]:
     """
     检查是否有相似桶可合并，有则合并，无则新建。返回 (桶ID或名称, 是否合并, embed警告信息)。
@@ -431,6 +433,8 @@ async def merge_or_create(
             valence=valence, arousal=arousal, name=name, raw_merge=raw_merge,
             why_remembered=why_remembered, source_tool=source_tool,
             grow_batch_id=grow_batch_id,
+            meaning=meaning,
+            media=media,
         )
 
 
@@ -446,6 +450,8 @@ async def _merge_or_create_inner(
     why_remembered: str = "",
     source_tool: str = "",
     grow_batch_id: str = "",
+    meaning: str = "",
+    media: list | None = None,
 ) -> Tuple[str, bool, str]:
     """实际的 search→merge/create 逻辑，由 merge_or_create 在 Lock 保护下调用。"""
     try:
@@ -517,6 +523,8 @@ async def _merge_or_create_inner(
         why_remembered=why_remembered,
         source_tool=source_tool,
         grow_batch_id=grow_batch_id,
+        meaning=meaning,
+        media=media,
     )
     # iter 2.1+ 起 create() 内部已调用 _sync_embedding，此处无需重复生成。
     # 只需从 embedding_engine 探测上次是否成功（检查 db 中是否有该 id）。
@@ -687,3 +695,37 @@ async def cascade_plan_resolved_to_buckets(plan_meta: dict, plan_id: str) -> lis
 # 向后兼容：保留下划线别名（部分历史调用点用 _ 前缀）
 _check_duplicate_for = check_duplicate_for
 _check_plan_resolution = check_plan_resolution
+
+
+# --- v2.6.4 补丁：check_metadata_size ---
+_DEFAULT_MAX_METADATA_BYTES = 16 * 1024
+
+
+def _configured_limit(name: str, default: int) -> int:
+    raw = limits_cfg().get(name, default)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if value >= 0 else default
+
+
+def max_metadata_bytes() -> int:
+    return _configured_limit('max_metadata_bytes', _DEFAULT_MAX_METADATA_BYTES)
+
+
+def check_metadata_size(**fields: object) -> str | None:
+    cap = max_metadata_bytes()
+    if cap <= 0:
+        return None
+    try:
+        size = sum(len(str(value or '').encode('utf-8')) for value in fields.values())
+    except Exception:
+        return '元数据参数无法安全序列化。'
+    if size > cap:
+        labels = ', '.join(fields)
+        return (
+            f'元数据过大（{size / 1024:.1f} KB > 上限 {cap / 1024:.0f} KB；字段: {labels}）。'
+            '请缩短标签、名称或筛选条件。'
+        )
+    return None

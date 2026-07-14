@@ -34,7 +34,6 @@ def format_dream_output(
     connection_hint: str,
     crystal_hint: str,
     core_context: list | None = None,
-    constellation_hint: str = "",
 ) -> str:
     parts = []
     for b in recent:
@@ -84,7 +83,7 @@ def format_dream_output(
             + "\n---\n".join(core_lines)
         )
 
-    final_text += connection_hint + crystal_hint + constellation_hint
+    final_text += connection_hint + crystal_hint
 
     # --- active plan 段 ---
     try:
