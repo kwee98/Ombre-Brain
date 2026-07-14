@@ -84,6 +84,32 @@ _AUTO_RESOLVE_IMPORTANCE_MAX = 4   # 重要度 ≤ 4 才允许自动结案
 _AUTO_RESOLVE_DAYS_MIN = 30        # 且 30 天未被激活
 _AUTO_RESOLVE_FALLBACK_DAYS = 999  # 时间字段坏掉时，按"很久以前"对待，触发自动结案
 
+# --- 用进废退（2026-07-11）：常被想起的记忆衰减更慢（间隔重复模型）---
+# breath 命中会 touch()（activation_count+1），此处把激活次数折算成 λ 放慢倍率：
+#   有效λ = λ / min(MAX_SLOWDOWN, 1 + LOG_FACTOR × ln(1 + activation_count))
+# act=0 → 原速；act=3 → 慢 1.69×；act=10 → 慢 2.2×；上限 3×。
+# 对数增长：想起再多次也不会永生，只是半衰期变长——用进废退，不是用进永存。
+_REINFORCE_LOG_FACTOR = 0.5
+_REINFORCE_MAX_SLOWDOWN = 3.0
+
+# --- 类型TTL遗忘政策（2026-07-11）---
+# 与权重衰减的区别：权重是"不重要的忘"，TTL 是"有些事再重要也该让它过去"。
+# 类别解析：metadata["ttl_class"] 显式字段优先，否则按 tags 映射（_TTL_TAG_MAP）。
+#   core / diary / milestone → 永不衰减（返回 _SCORE_FEEL，不参与归档）
+#   daily → 3 天保鲜期，之后才开始计衰减天数
+#   mood  → 7 天保鲜期，之后重要度封顶 + λ×3 加速淡化（坏心情该过去就过去）
+_TTL_NEVER = ("core", "diary", "milestone")
+_TTL_GRACE_DAYS = {"daily": 3.0, "mood": 7.0}
+_TTL_TAG_MAP = {
+    "daily": "daily", "日常": "daily", "流水": "daily",
+    "mood": "mood", "心情": "mood", "情绪": "mood", "吐槽": "mood", "懊恼": "mood",
+    "diary": "diary", "日记": "diary",
+    "milestone": "milestone", "里程碑": "milestone",
+    "core": "core", "身份": "core",
+}
+_MOOD_IMPORTANCE_CAP = 4          # mood 过保鲜期后重要度封顶
+_MOOD_EXPIRED_LAMBDA_MULT = 3.0   # mood 过保鲜期后 λ 加速倍率
+
 # --- Arousal/importance 兜底 ---
 _DEFAULT_AROUSAL = 0.3
 _DEFAULT_IMPORTANCE = 5
@@ -116,6 +142,26 @@ def _days_since_active(meta: dict, fallback_days: float = _DEFAULT_DAYS_FALLBACK
         return max(0.0, (datetime.now() - last_active).total_seconds() / _SECONDS_PER_DAY)
     except (ValueError, TypeError):
         return float(fallback_days)
+
+
+def _ttl_class(meta: dict) -> "str | None":
+    """解析桶的 TTL 类别：显式 ttl_class 字段优先，否则按 tags 映射。
+
+    返回 "core"/"daily"/"mood"/"diary"/"milestone" 或 None（无 TTL 政策，走通用衰减）。
+    """
+    explicit = meta.get("ttl_class")
+    if isinstance(explicit, str) and (
+        explicit in _TTL_NEVER or explicit in _TTL_GRACE_DAYS
+    ):
+        return explicit
+    tags = meta.get("tags") or []
+    if not isinstance(tags, list):
+        return None
+    for tag in tags:
+        cls = _TTL_TAG_MAP.get(str(tag))
+        if cls:
+            return cls
+    return None
 
 
 class DecayEngine:
@@ -202,9 +248,15 @@ class DecayEngine:
         if metadata.get("type") == "feel":
             return _SCORE_FEEL
 
-        # --- Plan / letter buckets: never decay (status-driven, not time-driven) ---
-        # --- plan / letter 桶不衰减；plan 由 status 字段控制生命周期，letter 永久保存 ---
-        if metadata.get("type") in ("plan", "letter"):
+        # --- Plan / letter / belief buckets: never decay ---
+        # --- plan 由 status 控制生命周期；letter 永久；belief 由 confidence 自治，
+        #     立场不应该按日历过期（2026-07-11 修：此前 belief 走通用衰减是漏网）---
+        if metadata.get("type") in ("plan", "letter", "belief"):
+            return _SCORE_FEEL
+
+        # --- 类型TTL政策：core/diary/milestone 永不衰减 ---
+        ttl_cls = _ttl_class(metadata)
+        if ttl_cls in _TTL_NEVER:
             return _SCORE_FEEL
 
         try:
@@ -215,6 +267,23 @@ class DecayEngine:
 
         # --- Days since last activation ---
         days_since = _days_since_active(metadata, fallback_days=_DEFAULT_DAYS_FALLBACK)
+
+        # --- 类型TTL：daily/mood 有保鲜期，期内不计衰减天数 ---
+        # mood 过期后：重要度封顶 + λ 加速——再重要的坏心情也该让它过去
+        grace = _TTL_GRACE_DAYS.get(ttl_cls, 0.0)
+        decay_days = max(0.0, days_since - grace) if grace else days_since
+        lambda_mult = 1.0
+        if ttl_cls == "mood" and days_since > grace:
+            importance = min(importance, _MOOD_IMPORTANCE_CAP)
+            lambda_mult = _MOOD_EXPIRED_LAMBDA_MULT
+
+        # --- 用进废退：激活次数放慢有效衰减率（对数增长，上限 3×）---
+        act_raw = max(0.0, float(metadata.get("activation_count") or 0))
+        slowdown = min(
+            _REINFORCE_MAX_SLOWDOWN,
+            1.0 + _REINFORCE_LOG_FACTOR * math.log1p(act_raw),
+        )
+        effective_lambda = self.decay_lambda * lambda_mult / slowdown
 
         # --- Emotion weight ---
         try:
@@ -246,7 +315,7 @@ class DecayEngine:
         base_score = (
             importance
             * (activation_count ** _ACTIVATION_EXPONENT)
-            * math.exp(-self.decay_lambda * days_since)
+            * math.exp(-effective_lambda * decay_days)
             * combined_weight
         )
 
@@ -298,10 +367,14 @@ class DecayEngine:
         for bucket in buckets:
             meta = bucket.get("metadata", {})
 
-            # Skip permanent / pinned / protected / feel / i buckets
-            # 跳过固化桶、钉选/保护桶、feel 桶和 i（自我认知）桶
-            # i 桶承诺永不衰减（tools/i/core.py 注释）——必须在此显式排除
-            if meta.get("type") in ("permanent", "feel", "i") or meta.get("pinned") or meta.get("protected"):
+            # Skip permanent / pinned / protected / feel / i / belief buckets
+            # 跳过固化桶、钉选/保护桶、feel 桶、i（自我认知）桶和 belief（信念）桶
+            # i 桶承诺永不衰减（tools/i/core.py 注释）；belief 由 confidence 自治（2026-07-11）
+            if meta.get("type") in ("permanent", "feel", "i", "belief") or meta.get("pinned") or meta.get("protected"):
+                continue
+
+            # TTL 永久类（core/diary/milestone）也不进 auto-resolve/归档流程
+            if _ttl_class(meta) in _TTL_NEVER:
                 continue
 
             checked += 1

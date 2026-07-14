@@ -245,6 +245,10 @@ class BucketManager:
         # 都会 _invalidate_bm25 → 一并清缓存）。touch/ripple 就地更新缓存条目、不清整表。
         self._active_cache: "list[dict] | None" = None
 
+        # 骨头：显式边表（SQLite），与 embeddings.db 同级
+        self._edge_db_path = os.path.join(self.base_dir, "edges.db")
+        self._init_edge_table()
+
     def attach_v3_runtime(self, runtime) -> None:
         self.v3_runtime = runtime
 
@@ -270,10 +274,6 @@ class BucketManager:
             )
         except Exception as exc:
             logger.warning(f"v3 bucket event record failed for {action}:{bucket_id}: {exc}")
-
-        # 骨头：显式边表（SQLite），与 embeddings.db 同级
-        self._edge_db_path = os.path.join(self.base_dir, "edges.db")
-        self._init_edge_table()
 
     # ---------------------------------------------------------
     # 骨头 (Edge store) — 显式记忆图

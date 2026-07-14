@@ -34,6 +34,43 @@ def _truthy(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _is_feel(meta) -> bool:
+    dom = meta.get("domain")
+    return (
+        meta.get("type") == "feel"
+        or dom == "feel"
+        or (isinstance(dom, (list, tuple)) and "feel" in dom)
+    )
+
+
+def _feel_age_note(meta):
+    """1.7 feel时间感（2026-07-14）：feel 桶经 /prompt-hook 浮现时的年龄标注。
+    总纲：旧感受可以成为证据，不能未经签收成为当前情绪。
+    prompt-hook 侧只按日历算（lived_delta 全量版在 tools/breath/feel.py）。
+    返回 (label, lens_note)；非 feel 或当天的返回 ("", "")。"""
+    from datetime import datetime
+    if not _is_feel(meta):
+        return "", ""
+    created = str(meta.get("created", "")).strip()
+    dt = None
+    for fmt in ("%Y-%m-%d %H-%M-%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(created[: len(datetime.now().strftime(fmt))], fmt)
+            break
+        except (ValueError, TypeError):
+            continue
+    if dt is None:
+        return "", ""
+    days = (datetime.now() - dt).days
+    if days <= 0:
+        return "", ""
+    label = f"【{days}天前的感受】"
+    lens = ""
+    if days > 7:
+        lens = "（当时的水温，不是现在的——可反思/识别模式，不可直接当作此刻情绪续写）"
+    return label, lens
+
+
 def _hook_setting(name: str, default=None):
     hooks_cfg = (getattr(sh, "config", {}) or {}).get("hooks") or {}
     return hooks_cfg.get(name, default)
@@ -257,15 +294,19 @@ def register(mcp) -> None:
                 if b.get("score", 0) < 0.25:
                     continue
                 meta = b.get("metadata", {})
-                if meta.get("domain") == "feel":
-                    continue
+                # 2026-07-14 1.7：feel 允许浮现但必须带年龄。原 `domain == "feel"` 过滤
+                # 拿 list 和字符串比较从未生效，而实践证明 feel 浮现有价值（SEAM 靠它
+                # 把感官记忆带回来）——治法是标注，不是封禁。
                 tags = meta.get("tags", [])
                 if "用户画像" in tags or "portrait" in tags:
                     continue
+                feel_label, feel_lens = _feel_age_note(meta)
                 preview = strip_wikilinks(b.get("content", ""))[:300]
                 name = meta.get("name", b["id"])
                 prefix = "[AI自主·" if "ai_self" in tags else "["
-                entry = f"{prefix}{name}]\n{preview}"
+                entry = f"{prefix}{name}]{feel_label}\n{preview}"
+                if feel_lens:
+                    entry += f"\n{feel_lens}"
                 token_budget -= count_tokens_approx(entry)
                 if token_budget < 0:
                     break
@@ -283,7 +324,9 @@ def register(mcp) -> None:
                         if not nb_data:
                             continue
                         nb_meta = nb_data.get("metadata", {})
-                        if nb_meta.get("domain") == "feel":
+                        # 1.7：邻居扩散是次级浮现，旧 feel 不该未经检索从骨头缝里爬出来
+                        # ——这里维持排除（原比较写错了 list vs 字符串，此处修正使其真正生效）
+                        if _is_feel(nb_meta):
                             continue
                         nb_name = nb_meta.get("name", nb_id)
                         nb_preview = strip_wikilinks(nb_data.get("content", ""))[:200]
